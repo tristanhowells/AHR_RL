@@ -146,7 +146,10 @@ MAX_EXPOSURE_MULTIPLIER = 1.5
 STEP_REWARD_TRADE = 0.01
 STEP_REWARD_NO_TRADE = -0.001
 MTM_REWARD_SCALE = 5.0
-SHARPE_REWARD_SCALE = 1.0
+# FIX: Was 1.0, producing ~-31 per episode and drowning all other signals.
+# Scaled down so Sharpe contribution is ~-0.3/episode, comparable to MTM and
+# terminal green-up rewards.
+SHARPE_REWARD_SCALE = 0.01
 
 # Depth / volatility / staleness constraints
 MIN_DEPTH_RATIO = 0.5
@@ -969,6 +972,9 @@ class MarketMakingEnv(gym.Env):
             'stale_market_violations': self.stale_market_violations,
             'suspended_violations': self.suspended_violations,
             'commission_rate': self.commission_rate,
+            # FIX: pass through info so callback reads BEFORE reset() zeros them
+            'commission_paid': self.total_commission_paid,
+            'green_up_pnl': self.balance - self.initial_balance,
         }
 
     def _build_episode_info(self, total_reward):
@@ -987,6 +993,9 @@ class MarketMakingEnv(gym.Env):
             'stale_market_violations': self.stale_market_violations,
             'suspended_violations': self.suspended_violations,
             'commission_rate': self.commission_rate,
+            # FIX: pass through info so callback reads BEFORE reset() zeros them
+            'commission_paid': self.total_commission_paid,
+            'green_up_pnl': self.balance - self.initial_balance,
         }
 
 
@@ -1132,8 +1141,9 @@ class TrainingMetricsCallback(BaseCallback):
             'Balance': info.get('final_balance', ep.get('final_balance', MAX_CAPITAL)),
             'Num_Trades': info.get('num_trades', ep.get('num_trades', 0)),
             'Realized_PnL': info.get('final_pnl', ep.get('realized_pnl', 0.0)),
-            'Green_Up_PnL': ep.get('realized_pnl', 0.0),
-            'Commission_Paid': getattr(env, 'total_commission_paid', 0.0),
+            # FIX: read from info dict (populated before reset zeros the env)
+            'Green_Up_PnL': info.get('green_up_pnl', ep.get('green_up_pnl', 0.0)),
+            'Commission_Paid': info.get('commission_paid', ep.get('commission_paid', 0.0)),
             'Commission_Rate': info.get('commission_rate', ep.get('commission_rate', COMMISSION_RATE)),
             'No_Trade_Streak': info.get('no_trade_streak', ep.get('no_trade_streak', 0)),
             'No_Trade_Penalty': info.get('no_trade_penalty', ep.get('no_trade_penalty', 0.0)),
