@@ -460,6 +460,12 @@ class MarketMakingEnv(gym.Env):
         self.stale_market_violations = 0
         self.suspended_violations = 0
 
+        # Action distribution tracking
+        self.back_trades = 0
+        self.lay_trades = 0
+        self.back_exposure = 0.0
+        self.lay_exposure = 0.0
+
     # ------------------------------------------------------------------
     # reset
     # ------------------------------------------------------------------
@@ -509,6 +515,12 @@ class MarketMakingEnv(gym.Env):
         self.volatility_violations = 0
         self.stale_market_violations = 0
         self.suspended_violations = 0
+
+        # Reset action distribution tracking
+        self.back_trades = 0
+        self.lay_trades = 0
+        self.back_exposure = 0.0
+        self.lay_exposure = 0.0
 
         return self._get_observation(), {}
 
@@ -719,6 +731,12 @@ class MarketMakingEnv(gym.Env):
                 success = self._execute_trade(runner_idx, side, liability, price)
                 if success:
                     trades_executed += 1
+                    if side == 'BACK':
+                        self.back_trades += 1
+                        self.back_exposure += liability
+                    else:
+                        self.lay_trades += 1
+                        self.lay_exposure += liability
         else:
             self.suspended_violations += 1
 
@@ -975,6 +993,11 @@ class MarketMakingEnv(gym.Env):
             # FIX: pass through info so callback reads BEFORE reset() zeros them
             'commission_paid': self.total_commission_paid,
             'green_up_pnl': self.balance - self.initial_balance,
+            # Action distribution
+            'back_trades': self.back_trades,
+            'lay_trades': self.lay_trades,
+            'back_exposure': self.back_exposure,
+            'lay_exposure': self.lay_exposure,
         }
 
     def _build_episode_info(self, total_reward):
@@ -996,6 +1019,11 @@ class MarketMakingEnv(gym.Env):
             # FIX: pass through info so callback reads BEFORE reset() zeros them
             'commission_paid': self.total_commission_paid,
             'green_up_pnl': self.balance - self.initial_balance,
+            # Action distribution
+            'back_trades': self.back_trades,
+            'lay_trades': self.lay_trades,
+            'back_exposure': self.back_exposure,
+            'lay_exposure': self.lay_exposure,
         }
 
 
@@ -1110,6 +1138,7 @@ class TrainingMetricsCallback(BaseCallback):
                 'Max_Drawdown', 'MTM_Reward', 'Sharpe_Reward',
                 'Depth_Violations', 'Volatility_Violations',
                 'Stale_Market_Violations', 'Suspended_Violations',
+                'Back_Trades', 'Lay_Trades', 'Back_Exposure', 'Lay_Exposure',
             ]).to_csv(self.save_path, index=False)
 
     def _on_step(self) -> bool:
@@ -1155,6 +1184,10 @@ class TrainingMetricsCallback(BaseCallback):
             'Volatility_Violations': info.get('volatility_violations', ep.get('volatility_violations', 0)),
             'Stale_Market_Violations': info.get('stale_market_violations', ep.get('stale_market_violations', 0)),
             'Suspended_Violations': info.get('suspended_violations', ep.get('suspended_violations', 0)),
+            'Back_Trades': info.get('back_trades', ep.get('back_trades', 0)),
+            'Lay_Trades': info.get('lay_trades', ep.get('lay_trades', 0)),
+            'Back_Exposure': info.get('back_exposure', ep.get('back_exposure', 0.0)),
+            'Lay_Exposure': info.get('lay_exposure', ep.get('lay_exposure', 0.0)),
         }
         self.metrics.append(metrics)
 
@@ -1176,11 +1209,20 @@ class TrainingMetricsCallback(BaseCallback):
             avg_depth_v = np.mean([m['Depth_Violations'] for m in recent])
             avg_susp_v = np.mean([m['Suspended_Violations'] for m in recent])
 
+            avg_back = np.mean([m['Back_Trades'] for m in recent])
+            avg_lay = np.mean([m['Lay_Trades'] for m in recent])
+            total_back = sum(m['Back_Trades'] for m in recent)
+            total_lay = sum(m['Lay_Trades'] for m in recent)
+            back_pct = total_back / max(total_back + total_lay, 1) * 100
+            avg_back_exp = np.mean([m['Back_Exposure'] for m in recent])
+            avg_lay_exp = np.mean([m['Lay_Exposure'] for m in recent])
+
             print(f"\n  Ep {self.episode_count} | Step {self.num_timesteps:,}")
             if self.curriculum_tracker:
                 print(f"   {self.curriculum_tracker.get_status_string()}")
             print(f"   Trade Rate: {trade_rate:.0f}% | Avg Trades: {avg_trades:.1f}")
             print(f"   Avg P&L: ${avg_pnl:.2f} | Avg Commission: ${avg_comm:.2f}")
+            print(f"   Back/Lay: {avg_back:.1f}/{avg_lay:.1f} ({back_pct:.0f}% back) | Exp: ${avg_back_exp:.2f}/${avg_lay_exp:.2f}")
             print(f"   Avg Drawdown: {avg_dd:.1f}%")
             print(f"   Avg Depth Viol: {avg_depth_v:.1f} | Avg Suspended Viol: {avg_susp_v:.1f}")
 
@@ -1208,6 +1250,7 @@ class ValidationCallback(BaseCallback):
                 'MTM_Reward', 'Sharpe_Reward',
                 'Depth_Violations', 'Volatility_Violations',
                 'Stale_Market_Violations', 'Suspended_Violations',
+                'Back_Trades', 'Lay_Trades', 'Back_Exposure', 'Lay_Exposure',
             ]).to_csv(self.save_path, index=False)
 
     def _on_step(self) -> bool:
@@ -1249,6 +1292,10 @@ class ValidationCallback(BaseCallback):
                     'Volatility_Violations': actual_env.volatility_violations,
                     'Stale_Market_Violations': actual_env.stale_market_violations,
                     'Suspended_Violations': actual_env.suspended_violations,
+                    'Back_Trades': actual_env.back_trades,
+                    'Lay_Trades': actual_env.lay_trades,
+                    'Back_Exposure': actual_env.back_exposure,
+                    'Lay_Exposure': actual_env.lay_exposure,
                 }
                 val_results.append(result)
             except Exception as e:
@@ -1265,9 +1312,18 @@ class ValidationCallback(BaseCallback):
             win_rate = (df['Realized_PnL'] > 0).sum() / len(df) * 100
             mean_comm = df['Commission_Paid'].mean()
 
+            mean_back = df['Back_Trades'].mean()
+            mean_lay = df['Lay_Trades'].mean()
+            total_back = df['Back_Trades'].sum()
+            total_lay = df['Lay_Trades'].sum()
+            back_pct = total_back / max(total_back + total_lay, 1) * 100
+            mean_back_exp = df['Back_Exposure'].mean()
+            mean_lay_exp = df['Lay_Exposure'].mean()
+
             print(f"\n  Validation Summary ({len(val_results)} episodes):")
             print(f"   Mean P&L: ${mean_pnl:.2f} | Win Rate: {win_rate:.0f}%")
             print(f"   Mean Trades: {mean_trades:.1f} | Trade Rate: {trade_rate:.0f}%")
+            print(f"   Back/Lay: {mean_back:.1f}/{mean_lay:.1f} ({back_pct:.0f}% back) | Exp: ${mean_back_exp:.2f}/${mean_lay_exp:.2f}")
             print(f"   Mean Commission: ${mean_comm:.2f}")
             print(f"   Avg Depth Viol: {df['Depth_Violations'].mean():.1f}")
             print(f"   Avg Suspended Viol: {df['Suspended_Violations'].mean():.1f}")
