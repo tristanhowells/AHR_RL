@@ -466,6 +466,9 @@ class MarketMakingEnv(gym.Env):
         self.back_exposure = 0.0
         self.lay_exposure = 0.0
 
+        # Mid-race realized P&L (from position netting)
+        self.mid_race_pnl = 0.0
+
     # ------------------------------------------------------------------
     # reset
     # ------------------------------------------------------------------
@@ -521,6 +524,9 @@ class MarketMakingEnv(gym.Env):
         self.lay_trades = 0
         self.back_exposure = 0.0
         self.lay_exposure = 0.0
+
+        # Reset mid-race realized P&L
+        self.mid_race_pnl = 0.0
 
         return self._get_observation(), {}
 
@@ -669,6 +675,7 @@ class MarketMakingEnv(gym.Env):
 
         mtm_before = self._get_total_unrealized_pnl()
         trades_executed = 0
+        self._step_realized_pnl = 0.0
 
         if market_open:
             for runner_idx in range(min(24, self.runner_count)):
@@ -750,7 +757,9 @@ class MarketMakingEnv(gym.Env):
 
         # ---- Rewards ----
         mtm_after = self._get_total_unrealized_pnl()
-        mtm_change = mtm_after - mtm_before
+        # FIX: include realized P&L from netting so closing a profitable
+        # position is not penalized (unrealized → realized is MTM-neutral)
+        mtm_change = (mtm_after - mtm_before) + self._step_realized_pnl
         mtm_reward = (mtm_change / MAX_CAPITAL) * MTM_REWARD_SCALE
 
         self.pnl_history.append(mtm_change)
@@ -845,23 +854,63 @@ class MarketMakingEnv(gym.Env):
             }
 
         pos = self.positions[runner_idx]
+        remaining_stake = stake
 
-        if side == 'BACK':
-            new_total = pos['total_back_stake'] + stake
-            if new_total > 0:
-                pos['weighted_back_price'] = (
-                    (pos['weighted_back_price'] * pos['total_back_stake'] + price * stake) / new_total
-                )
-            pos['total_back_stake'] = new_total
-            pos['net_stake'] += stake
-        else:
-            new_total = pos['total_lay_stake'] + stake
-            if new_total > 0:
-                pos['weighted_lay_price'] = (
-                    (pos['weighted_lay_price'] * pos['total_lay_stake'] + price * stake) / new_total
-                )
-            pos['total_lay_stake'] = new_total
-            pos['net_stake'] -= stake
+        # --- Position netting: close opposing side first ---
+        if side == 'BACK' and pos['total_lay_stake'] > 0.01:
+            close_amount = min(remaining_stake, pos['total_lay_stake'])
+            # Closing lay by backing: pnl = stake * (C - wl) / C
+            realized = close_amount * (price - pos['weighted_lay_price']) / price
+            if realized > 0:
+                comm = realized * self.commission_rate
+                self.total_commission_paid += comm
+                realized -= comm
+            self.balance += realized
+            self.mid_race_pnl += realized
+            self._step_realized_pnl += realized
+            pos['total_lay_stake'] -= close_amount
+            pos['net_stake'] += close_amount
+            remaining_stake -= close_amount
+            if pos['total_lay_stake'] < 0.01:
+                pos['total_lay_stake'] = 0.0
+                pos['weighted_lay_price'] = 0.0
+
+        elif side == 'LAY' and pos['total_back_stake'] > 0.01:
+            close_amount = min(remaining_stake, pos['total_back_stake'])
+            # Closing back by laying: pnl = stake * (wb - C) / C
+            realized = close_amount * (pos['weighted_back_price'] - price) / price
+            if realized > 0:
+                comm = realized * self.commission_rate
+                self.total_commission_paid += comm
+                realized -= comm
+            self.balance += realized
+            self.mid_race_pnl += realized
+            self._step_realized_pnl += realized
+            pos['total_back_stake'] -= close_amount
+            pos['net_stake'] -= close_amount
+            remaining_stake -= close_amount
+            if pos['total_back_stake'] < 0.01:
+                pos['total_back_stake'] = 0.0
+                pos['weighted_back_price'] = 0.0
+
+        # --- Open new position with remaining stake ---
+        if remaining_stake > 0.01:
+            if side == 'BACK':
+                new_total = pos['total_back_stake'] + remaining_stake
+                if new_total > 0:
+                    pos['weighted_back_price'] = (
+                        (pos['weighted_back_price'] * pos['total_back_stake'] + price * remaining_stake) / new_total
+                    )
+                pos['total_back_stake'] = new_total
+                pos['net_stake'] += remaining_stake
+            else:
+                new_total = pos['total_lay_stake'] + remaining_stake
+                if new_total > 0:
+                    pos['weighted_lay_price'] = (
+                        (pos['weighted_lay_price'] * pos['total_lay_stake'] + price * remaining_stake) / new_total
+                    )
+                pos['total_lay_stake'] = new_total
+                pos['net_stake'] -= remaining_stake
 
         trade_info = {
             'step': self.step_idx, 'runner': runner_idx, 'side': side,
@@ -998,6 +1047,8 @@ class MarketMakingEnv(gym.Env):
             'lay_trades': self.lay_trades,
             'back_exposure': self.back_exposure,
             'lay_exposure': self.lay_exposure,
+            # Mid-race realized P&L (from position netting)
+            'mid_race_pnl': self.mid_race_pnl,
         }
 
     def _build_episode_info(self, total_reward):
@@ -1024,6 +1075,8 @@ class MarketMakingEnv(gym.Env):
             'lay_trades': self.lay_trades,
             'back_exposure': self.back_exposure,
             'lay_exposure': self.lay_exposure,
+            # Mid-race realized P&L (from position netting)
+            'mid_race_pnl': self.mid_race_pnl,
         }
 
 
@@ -1139,6 +1192,7 @@ class TrainingMetricsCallback(BaseCallback):
                 'Depth_Violations', 'Volatility_Violations',
                 'Stale_Market_Violations', 'Suspended_Violations',
                 'Back_Trades', 'Lay_Trades', 'Back_Exposure', 'Lay_Exposure',
+                'Mid_Race_PnL',
             ]).to_csv(self.save_path, index=False)
 
     def _on_step(self) -> bool:
@@ -1188,6 +1242,7 @@ class TrainingMetricsCallback(BaseCallback):
             'Lay_Trades': info.get('lay_trades', ep.get('lay_trades', 0)),
             'Back_Exposure': info.get('back_exposure', ep.get('back_exposure', 0.0)),
             'Lay_Exposure': info.get('lay_exposure', ep.get('lay_exposure', 0.0)),
+            'Mid_Race_PnL': info.get('mid_race_pnl', ep.get('mid_race_pnl', 0.0)),
         }
         self.metrics.append(metrics)
 
@@ -1216,12 +1271,13 @@ class TrainingMetricsCallback(BaseCallback):
             back_pct = total_back / max(total_back + total_lay, 1) * 100
             avg_back_exp = np.mean([m['Back_Exposure'] for m in recent])
             avg_lay_exp = np.mean([m['Lay_Exposure'] for m in recent])
+            avg_mid_pnl = np.mean([m['Mid_Race_PnL'] for m in recent])
 
             print(f"\n  Ep {self.episode_count} | Step {self.num_timesteps:,}")
             if self.curriculum_tracker:
                 print(f"   {self.curriculum_tracker.get_status_string()}")
             print(f"   Trade Rate: {trade_rate:.0f}% | Avg Trades: {avg_trades:.1f}")
-            print(f"   Avg P&L: ${avg_pnl:.2f} | Avg Commission: ${avg_comm:.2f}")
+            print(f"   Avg P&L: ${avg_pnl:.2f} | Mid-Race P&L: ${avg_mid_pnl:.2f} | Commission: ${avg_comm:.2f}")
             print(f"   Back/Lay: {avg_back:.1f}/{avg_lay:.1f} ({back_pct:.0f}% back) | Exp: ${avg_back_exp:.2f}/${avg_lay_exp:.2f}")
             print(f"   Avg Drawdown: {avg_dd:.1f}%")
             print(f"   Avg Depth Viol: {avg_depth_v:.1f} | Avg Suspended Viol: {avg_susp_v:.1f}")
@@ -1251,6 +1307,7 @@ class ValidationCallback(BaseCallback):
                 'Depth_Violations', 'Volatility_Violations',
                 'Stale_Market_Violations', 'Suspended_Violations',
                 'Back_Trades', 'Lay_Trades', 'Back_Exposure', 'Lay_Exposure',
+                'Mid_Race_PnL',
             ]).to_csv(self.save_path, index=False)
 
     def _on_step(self) -> bool:
@@ -1296,6 +1353,7 @@ class ValidationCallback(BaseCallback):
                     'Lay_Trades': actual_env.lay_trades,
                     'Back_Exposure': actual_env.back_exposure,
                     'Lay_Exposure': actual_env.lay_exposure,
+                    'Mid_Race_PnL': actual_env.mid_race_pnl,
                 }
                 val_results.append(result)
             except Exception as e:
@@ -1319,9 +1377,10 @@ class ValidationCallback(BaseCallback):
             back_pct = total_back / max(total_back + total_lay, 1) * 100
             mean_back_exp = df['Back_Exposure'].mean()
             mean_lay_exp = df['Lay_Exposure'].mean()
+            mean_mid_pnl = df['Mid_Race_PnL'].mean()
 
             print(f"\n  Validation Summary ({len(val_results)} episodes):")
-            print(f"   Mean P&L: ${mean_pnl:.2f} | Win Rate: {win_rate:.0f}%")
+            print(f"   Mean P&L: ${mean_pnl:.2f} | Mid-Race P&L: ${mean_mid_pnl:.2f} | Win Rate: {win_rate:.0f}%")
             print(f"   Mean Trades: {mean_trades:.1f} | Trade Rate: {trade_rate:.0f}%")
             print(f"   Back/Lay: {mean_back:.1f}/{mean_lay:.1f} ({back_pct:.0f}% back) | Exp: ${mean_back_exp:.2f}/${mean_lay_exp:.2f}")
             print(f"   Mean Commission: ${mean_comm:.2f}")
@@ -1359,6 +1418,8 @@ print("  In-play detection via 'in_play' column")
 print("  Market SUSPENDED check")
 print("  Commission rate read from data (default 5%)")
 print("  Separate back/lay weighted price tracking")
+print("  Position netting: opposing trades close existing positions")
+print("  Mid-race P&L realization with immediate capital release")
 '''
 
 # ---------------------------------------------------------------------------

@@ -319,6 +319,120 @@ check("env._get_position_pnl LAY@3 now@4", abs(pnl_lay - 2.5) < 1e-6,
 
 
 # ---------------------------------------------------------------------------
+# Test 11: Position netting — close back with lay
+# ---------------------------------------------------------------------------
+print("\n=== Test 11: Position netting ===")
+
+env7 = MarketMakingEnv(race_files=[PARQUET])
+obs, _ = env7.reset()
+env7.commission_rate = 0.05
+
+# Manually open a BACK position: stake=10 at price=3.0
+env7._step_realized_pnl = 0.0
+env7._execute_trade(0, 'BACK', 10.0, 3.0)
+check("back position opened", env7.positions[0]['total_back_stake'] == 10.0,
+      f"got {env7.positions[0]['total_back_stake']}")
+initial_bal = env7.balance
+
+# Close by laying — liability=15 -> stake=15/(2.5-1)=10, fully closes back
+env7._step_realized_pnl = 0.0
+env7._execute_trade(0, 'LAY', 15.0, 2.5)
+# P&L = 10 * (3.0 - 2.5) / 2.5 = 2.0 gross, commission = 0.10, net = 1.90
+expected_pnl = 10.0 * (3.0 - 2.5) / 2.5 * 0.95  # 1.90
+check("back fully closed", env7.positions[0]['total_back_stake'] < 0.01,
+      f"got {env7.positions[0]['total_back_stake']}")
+check("lay not opened (exact close)", env7.positions[0]['total_lay_stake'] < 0.01,
+      f"got {env7.positions[0]['total_lay_stake']}")
+check("balance increased by net P&L",
+      abs(env7.balance - initial_bal - expected_pnl) < 0.01,
+      f"expected +${expected_pnl:.2f}, got +${env7.balance - initial_bal:.2f}")
+check("mid_race_pnl tracked",
+      abs(env7.mid_race_pnl - expected_pnl) < 0.01,
+      f"expected ${expected_pnl:.2f}, got ${env7.mid_race_pnl:.2f}")
+check("step_realized_pnl tracked",
+      abs(env7._step_realized_pnl - expected_pnl) < 0.01,
+      f"expected ${expected_pnl:.2f}, got ${env7._step_realized_pnl:.2f}")
+
+# Test partial close + flip
+print("\n=== Test 12: Partial close + overshoot opens opposite side ===")
+env8 = MarketMakingEnv(race_files=[PARQUET])
+obs, _ = env8.reset()
+env8.commission_rate = 0.05
+
+# Open BACK 10 at 4.0
+env8._step_realized_pnl = 0.0
+env8._execute_trade(0, 'BACK', 10.0, 4.0)
+check("back=10 opened", env8.positions[0]['total_back_stake'] == 10.0, "")
+
+# Lay 20 at 3.0 (price shortened): stake=20/(3-1)=10, but only 10 to close
+# Wait - we need lay stake > back stake to test overshoot
+# Lay with liability=30 at price 3.0: stake = 30/2 = 15
+# closes 10 of back, opens 5 of lay
+env8._step_realized_pnl = 0.0
+initial_bal8 = env8.balance
+env8._execute_trade(0, 'LAY', 30.0, 3.0)
+# Closed 10 back at 4.0, lay at 3.0: pnl = 10*(4.0-3.0)/3.0 = 3.333
+# Commission on profit: 3.333 * 0.05 = 0.1667, net = 3.1667
+close_pnl = 10.0 * (4.0 - 3.0) / 3.0
+close_net = close_pnl * 0.95
+check("back fully closed after overshoot", env8.positions[0]['total_back_stake'] < 0.01,
+      f"got {env8.positions[0]['total_back_stake']}")
+check("lay opened with remainder", abs(env8.positions[0]['total_lay_stake'] - 5.0) < 0.01,
+      f"got {env8.positions[0]['total_lay_stake']}")
+check("realized P&L correct",
+      abs(env8.balance - initial_bal8 - close_net) < 0.01,
+      f"expected +${close_net:.2f}, got +${env8.balance - initial_bal8:.2f}")
+
+# Test closing lay with back (opposite direction)
+print("\n=== Test 13: Close lay position with back ===")
+env9 = MarketMakingEnv(race_files=[PARQUET])
+obs, _ = env9.reset()
+env9.commission_rate = 0.05
+
+# Open LAY: liability=20, price=3.0 -> stake = 20/2 = 10
+env9._step_realized_pnl = 0.0
+env9._execute_trade(0, 'LAY', 20.0, 3.0)
+check("lay=10 opened", abs(env9.positions[0]['total_lay_stake'] - 10.0) < 0.01,
+      f"got {env9.positions[0]['total_lay_stake']}")
+
+# Close by backing at 4.0 (drift, good for lay): stake=10
+env9._step_realized_pnl = 0.0
+initial_bal9 = env9.balance
+env9._execute_trade(0, 'BACK', 10.0, 4.0)
+# pnl = 10 * (4.0 - 3.0) / 4.0 = 2.5 gross, commission = 0.125, net = 2.375
+expected_lay_close = 10.0 * (4.0 - 3.0) / 4.0 * 0.95
+check("lay fully closed", env9.positions[0]['total_lay_stake'] < 0.01,
+      f"got {env9.positions[0]['total_lay_stake']}")
+check("balance increased (lay close)",
+      abs(env9.balance - initial_bal9 - expected_lay_close) < 0.01,
+      f"expected +${expected_lay_close:.2f}, got +${env9.balance - initial_bal9:.2f}")
+
+# Test losing close (back at bad price)
+print("\n=== Test 14: Losing close (back at worse price) ===")
+env10 = MarketMakingEnv(race_files=[PARQUET])
+obs, _ = env10.reset()
+env10.commission_rate = 0.05
+
+# Open BACK 10 at 3.0
+env10._step_realized_pnl = 0.0
+env10._execute_trade(0, 'BACK', 10.0, 3.0)
+initial_bal10 = env10.balance
+
+# Close by laying at 4.0 (price drifted, loss for back)
+# liability=30 -> stake=30/3=10
+env10._step_realized_pnl = 0.0
+env10._execute_trade(0, 'LAY', 30.0, 4.0)
+# pnl = 10*(3.0-4.0)/4.0 = -2.5 (loss, no commission)
+expected_loss = 10.0 * (3.0 - 4.0) / 4.0  # -2.5
+check("losing close: balance decreased",
+      abs(env10.balance - initial_bal10 - expected_loss) < 0.01,
+      f"expected ${expected_loss:.2f}, got ${env10.balance - initial_bal10:.2f}")
+check("losing close: no commission on loss",
+      env10.total_commission_paid < 0.01,
+      f"got commission={env10.total_commission_paid}")
+
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 print(f"\n{'='*60}")
