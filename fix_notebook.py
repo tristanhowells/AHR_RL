@@ -167,6 +167,18 @@ STALE_MARKET_THRESHOLD = 60
 # FIX: Cap for NoTradeStreakWrapper (was exponential up to -32)
 NO_TRADE_PENALTY_CAP = -2.0
 
+# ============================================================
+# GITHUB SYNC — auto-push metrics to repo during training
+# ============================================================
+# Set GITHUB_TOKEN to enable. On Colab, use Secrets or paste directly.
+# Example: from google.colab import userdata; GITHUB_TOKEN = userdata.get('GITHUB_TOKEN')
+GITHUB_SYNC_ENABLED = True
+GITHUB_REPO = 'tristanhowells/AHR_RL'
+GITHUB_TOKEN = ''  # Set your personal access token here
+GITHUB_SYNC_BRANCH = 'main'
+GITHUB_SYNC_INTERVAL_EPISODES = 50  # push training metrics every N episodes
+GITHUB_REPO_LOCAL = '/content/AHR_RL_repo'
+
 print(f"\\n  Configuration loaded for V44 (Position Netting)")
 print(f"\\n  Capital: ${MAX_CAPITAL:.0f}")
 print(f"   Commission: {COMMISSION_RATE*100:.0f}% (read from data per-race)")
@@ -1290,6 +1302,13 @@ class TrainingMetricsCallback(BaseCallback):
             print(f"   Avg Drawdown: {avg_dd:.1f}%")
             print(f"   Avg Depth Viol: {avg_depth_v:.1f} | Avg Suspended Viol: {avg_susp_v:.1f}")
 
+        # GitHub sync at configured interval
+        if self.episode_count % GITHUB_SYNC_INTERVAL_EPISODES == 0 and self.save_path:
+            sync_metrics_to_github(
+                training_csv_path=self.save_path,
+                message=f"Training metrics @ ep {self.episode_count}, step {self.num_timesteps:,}",
+            )
+
         return True
 
 
@@ -1300,11 +1319,12 @@ class TrainingMetricsCallback(BaseCallback):
 class ValidationCallback(BaseCallback):
     """Periodic validation with rich metrics."""
 
-    def __init__(self, val_env, val_interval=25000, save_path=None):
+    def __init__(self, val_env, val_interval=25000, save_path=None, training_csv_path=None):
         super().__init__()
         self.val_env = val_env
         self.val_interval = val_interval
         self.save_path = save_path
+        self.training_csv_path = training_csv_path
         self.val_metrics = []
 
         if self.save_path:
@@ -1398,6 +1418,14 @@ class ValidationCallback(BaseCallback):
             print("  No validation results collected")
 
         print("=" * 60)
+
+        # GitHub sync — push both training and validation metrics
+        sync_metrics_to_github(
+            training_csv_path=self.training_csv_path,
+            validation_csv_path=self.save_path,
+            message=f"Validation metrics @ step {self.num_timesteps:,}",
+        )
+
         return True
 
 
@@ -1417,6 +1445,61 @@ class CheckpointCallback(BaseCallback):
             self.model.save(path)
             print(f"  Model saved: {path}")
         return True
+
+
+# ============================================================
+# GITHUB SYNC HELPER
+# ============================================================
+
+def sync_metrics_to_github(training_csv_path=None, validation_csv_path=None, message="Update metrics"):
+    """Copy metrics CSVs to local repo clone and push to GitHub."""
+    if not GITHUB_SYNC_ENABLED or not GITHUB_TOKEN:
+        return False
+
+    import subprocess, shutil
+
+    repo_dir = GITHUB_REPO_LOCAL
+    if not os.path.isdir(repo_dir):
+        print(f"  [SYNC] Repo not found at {repo_dir}, skipping")
+        return False
+
+    try:
+        files_copied = []
+        if training_csv_path and os.path.exists(training_csv_path):
+            dst = os.path.join(repo_dir, 'training_metrics.csv')
+            shutil.copy2(training_csv_path, dst)
+            files_copied.append('training_metrics.csv')
+        if validation_csv_path and os.path.exists(validation_csv_path):
+            dst = os.path.join(repo_dir, 'validation_metrics.csv')
+            shutil.copy2(validation_csv_path, dst)
+            files_copied.append('validation_metrics.csv')
+
+        if not files_copied:
+            return False
+
+        run = lambda cmd: subprocess.run(
+            cmd, cwd=repo_dir, capture_output=True, text=True, timeout=30
+        )
+        run(['git', 'add'] + files_copied)
+        result = run(['git', 'commit', '-m', message])
+        if result.returncode != 0 and 'nothing to commit' in result.stdout:
+            return True  # no changes, that's fine
+        push_result = run(['git', 'push', 'origin', GITHUB_SYNC_BRANCH])
+        if push_result.returncode == 0:
+            print(f"  [SYNC] Pushed {', '.join(files_copied)} to GitHub")
+            return True
+        else:
+            # Retry once after pull
+            run(['git', 'pull', '--rebase', 'origin', GITHUB_SYNC_BRANCH])
+            push_result = run(['git', 'push', 'origin', GITHUB_SYNC_BRANCH])
+            if push_result.returncode == 0:
+                print(f"  [SYNC] Pushed {', '.join(files_copied)} to GitHub (after rebase)")
+                return True
+            print(f"  [SYNC] Push failed: {push_result.stderr[:100]}")
+            return False
+    except Exception as e:
+        print(f"  [SYNC] Error: {str(e)[:100]}")
+        return False
 
 
 print("\n  V44 Environment and callbacks loaded (Position Netting)!")
@@ -1468,6 +1551,32 @@ val_env = MarketMakingEnv(val_files, curriculum_tracker=None)
 val_env = Monitor(val_env)
 print("  Validation env: Monitor -> MarketMakingEnv")
 
+# GitHub sync setup
+if GITHUB_SYNC_ENABLED and GITHUB_TOKEN:
+    import subprocess
+    if not os.path.isdir(GITHUB_REPO_LOCAL):
+        print(f"\n  Cloning {GITHUB_REPO} for metrics sync...")
+        clone_url = f"https://{GITHUB_TOKEN}@github.com/{GITHUB_REPO}.git"
+        result = subprocess.run(
+            ['git', 'clone', '-b', GITHUB_SYNC_BRANCH, clone_url, GITHUB_REPO_LOCAL],
+            capture_output=True, text=True, timeout=60,
+        )
+        if result.returncode == 0:
+            # Configure git identity for commits
+            subprocess.run(['git', 'config', 'user.email', 'colab@auto.sync'], cwd=GITHUB_REPO_LOCAL, capture_output=True)
+            subprocess.run(['git', 'config', 'user.name', 'Colab Training'], cwd=GITHUB_REPO_LOCAL, capture_output=True)
+            print(f"  [SYNC] Repo cloned to {GITHUB_REPO_LOCAL}")
+        else:
+            print(f"  [SYNC] Clone failed: {result.stderr[:100]}")
+            GITHUB_SYNC_ENABLED = False
+    else:
+        print(f"  [SYNC] Repo already at {GITHUB_REPO_LOCAL}")
+        # Pull latest
+        subprocess.run(['git', 'pull', 'origin', GITHUB_SYNC_BRANCH], cwd=GITHUB_REPO_LOCAL, capture_output=True, timeout=30)
+else:
+    if GITHUB_SYNC_ENABLED:
+        print("\n  [SYNC] Disabled — no GITHUB_TOKEN set")
+
 # Callbacks
 print("\n  Setting up callbacks...")
 training_callback = TrainingMetricsCallback(
@@ -1479,6 +1588,7 @@ validation_callback = ValidationCallback(
     val_env=val_env,
     val_interval=25000,
     save_path=f"{BASE_PATH}/validation_metrics.csv",
+    training_csv_path=f"{BASE_PATH}/training_metrics.csv",
 )
 checkpoint_callback = CheckpointCallback(save_freq=50000, save_path=BASE_PATH)
 callbacks = CallbackList([training_callback, validation_callback, checkpoint_callback])
