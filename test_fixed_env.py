@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-test_fixed_env.py — Smoke-test the fixed V43 environment against the example parquet.
+test_fixed_env.py — Smoke-test the V44 environment against the example parquet.
 
 Tests:
   1. Environment instantiation with 755-dim observation
@@ -25,7 +25,7 @@ import pandas as pd
 # Step 0 — Extract and exec cells 2+3 from the fixed notebook so we get
 #           all constants, helpers, and classes in this namespace.
 # ---------------------------------------------------------------------------
-NB_PATH = "/home/user/AHR_RL/V43_Green_Up_Complete.ipynb"
+NB_PATH = "/home/user/AHR_RL/V44_Green_Up_Position_Netting.ipynb"
 PARQUET = "/home/user/AHR_RL/2026-02-13_Newcastle_Race7_1.253949170.parquet"
 
 with open(NB_PATH, "r") as f:

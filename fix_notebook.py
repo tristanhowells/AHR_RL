@@ -1,24 +1,32 @@
 #!/usr/bin/env python3
 """
-fix_notebook.py — Rebuild V43_Green_Up_Complete.ipynb with all critical bug fixes.
+fix_notebook.py — Build V44_Green_Up_Position_Netting.ipynb
 
-Fixes applied:
-  P0-1  Commission rate: 0.02 → read from data (default 0.05)
-  P0-2  In-play detection: use 'in_play' column instead of nonexistent 'seconds_to_start'
+V44 changes (on top of V43 fixes):
+  - Position netting: opposing trades close existing positions, P&L realized immediately
+  - Capital release: closed positions free capital for further trading
+  - MTM reward accounts for realized P&L (closing profitable positions is not penalized)
+  - Mid-race P&L tracking (distinct from terminal green-up)
+  - Action distribution logging: Back_Trades, Lay_Trades, Back_Exposure, Lay_Exposure
+  - Sharpe reward scale 0.01 (from V43 fix)
+  - Commission/green_up_pnl passed through info dict (from V43 fix)
+
+V43 fixes included:
+  P0-1  Commission rate: read from data (default 0.05)
+  P0-2  In-play detection: use 'in_play' column
   P0-3  Green-up LAY P&L formula corrected
-  P0-4  _get_position_pnl() made consistent with green-up formulas
+  P0-4  _get_position_pnl() consistent with green-up formulas
   P0-5  Cell 5 conflicting redefinitions removed
-  P1-1  weighted_price tracking: separate back/lay weighted prices
-  P1-2  step() checks in-play & market_status BEFORE executing trades
-  P1-3  Market status SUSPENDED check added
-  P1-4  Capital preservation bonus removed (was drowning trade signals)
+  P1-1  Separate back/lay weighted price tracking
+  P1-2  step() checks in-play & market_status BEFORE trades
+  P1-3  Market status SUSPENDED check
+  P1-4  Capital preservation bonus removed
   P1-5  NoTradeStreakWrapper penalty capped at -2.0
   P2-1  Price normalization uses log scale
-  P2-2  Sharpe reward requires 20 samples minimum, uses full window
-  P2-3  Diagnostic/dead cells 6-15 removed
-  P2-4  Training cell label V42 → V43
+  P2-2  Sharpe reward requires 20 samples minimum
+  P2-3  Diagnostic/dead cells removed
   P2-5  Validation split shuffled before splitting
-  P2-6  race_files not mutated on corrupt file (copy used)
+  P2-6  race_files not mutated on corrupt file
   P2-7  load_race_files reads only first row for validation
   P2-8  store current_race_file for debugging
 """
@@ -31,7 +39,7 @@ import sys
 # Load existing notebook
 # ---------------------------------------------------------------------------
 INPUT_PATH = "V43_Green_Up_Complete.ipynb"
-OUTPUT_PATH = "V43_Green_Up_Complete.ipynb"
+OUTPUT_PATH = "V44_Green_Up_Position_Netting.ipynb"
 
 with open(INPUT_PATH, "rb") as f:
     nb = json.load(f)
@@ -86,19 +94,19 @@ cell_1_src = """\
 # CELL 2 — Configuration  (FIXED)
 # ---------------------------------------------------------------------------
 cell_2_src = """\
-### CELL 3 - CONFIGURATION (V43 - FULL FEATURE SET, FIXED) ###
+### CELL 3 - CONFIGURATION (V44 - POSITION NETTING) ###
 
-# V43: All Features + Green-up Strategy
+# V44: All Features + Green-up Strategy + Position Netting
 # 755-dimensional observation space
 
 print("=" * 60)
-print("V43 Configuration - Full Feature Set + Green-up (FIXED)")
+print("V44 Configuration - Position Netting + Green-up")
 print("=" * 60)
 
 # ============================================================
 # PATHS
 # ============================================================
-BASE_PATH = '/content/drive/MyDrive/Betfair_RL/V43_Full_Features'
+BASE_PATH = '/content/drive/MyDrive/Betfair_RL/V44_Position_Netting'
 DATA_DIR = '/content/drive/MyDrive/race_out'
 
 import os
@@ -159,7 +167,7 @@ STALE_MARKET_THRESHOLD = 60
 # FIX: Cap for NoTradeStreakWrapper (was exponential up to -32)
 NO_TRADE_PENALTY_CAP = -2.0
 
-print(f"\\n  Configuration loaded for V43 (FIXED)")
+print(f"\\n  Configuration loaded for V44 (Position Netting)")
 print(f"\\n  Capital: ${MAX_CAPITAL:.0f}")
 print(f"   Commission: {COMMISSION_RATE*100:.0f}% (read from data per-race)")
 print(f"   Reserve ratio: {RESERVE_RATIO*100:.0f}%")
@@ -176,9 +184,9 @@ print("=" * 60)"""
 # ---------------------------------------------------------------------------
 # CELL 3 — Environment & Training Components  (ALL FIXES)
 # ---------------------------------------------------------------------------
-cell_3_src = r'''### CELL 4 - ENVIRONMENT & TRAINING COMPONENTS (V43 - FIXED) ###
+cell_3_src = r'''### CELL 4 - ENVIRONMENT & TRAINING COMPONENTS (V44 - POSITION NETTING) ###
 
-# V43 - Full Feature Set (755 dims) + Green-up Strategy
+# V44 - Full Feature Set (755 dims) + Green-up Strategy + Position Netting
 # All 26 available features per runner
 # Depth checking, volatility-based sizing, quality filtering
 
@@ -197,7 +205,7 @@ import os
 warnings.filterwarnings('ignore')
 
 print("=" * 60)
-print("Model Version: V43_Full_Features_Green_Up (FIXED)")
+print("Model Version: V44_Position_Netting_Green_Up")
 print("Algorithm: SAC + ALL Features + Green-up")
 print("=" * 60)
 
@@ -247,7 +255,7 @@ def safe_price_norm(price, epsilon=1e-8):
 
 def get_runner_data(row, runner_idx):
     """
-    V43: Extract ALL available features for a runner.
+    V44: Extract ALL available features for a runner.
     Returns 26 raw features per runner.
     """
     prefix = f'run[{runner_idx}].'
@@ -401,18 +409,18 @@ class CurriculumTracker:
 
 
 # ============================================================
-# MARKET MAKING ENVIRONMENT (V43 - ALL FEATURES, FIXED)
+# MARKET MAKING ENVIRONMENT (V44 - POSITION NETTING)
 # ============================================================
 
 class MarketMakingEnv(gym.Env):
-    """V43: Full feature set (755 dims) + Green-up strategy."""
+    """V44: Full feature set (755 dims) + Green-up + Position Netting."""
 
     metadata = {'render_modes': ['human']}
 
     def __init__(self, race_files, curriculum_tracker=None):
         super().__init__()
 
-        print(f"\n[ENV INIT] V43 with ALL features (755 dimensions)")
+        print(f"\n[ENV INIT] V44 with ALL features + Position Netting (755 dimensions)")
 
         self.race_files = list(race_files)  # FIX: own copy so removals don't shrink shared list
         self.curriculum_tracker = curriculum_tracker
@@ -1169,7 +1177,7 @@ def load_race_files(data_dir):
 
 
 # ============================================================
-# TRAINING METRICS CALLBACK (V43 — RICH LOGGING)
+# TRAINING METRICS CALLBACK (V44 — RICH LOGGING)
 # ============================================================
 
 class TrainingMetricsCallback(BaseCallback):
@@ -1286,7 +1294,7 @@ class TrainingMetricsCallback(BaseCallback):
 
 
 # ============================================================
-# VALIDATION CALLBACK (V43 — FIXED)
+# VALIDATION CALLBACK (V44)
 # ============================================================
 
 class ValidationCallback(BaseCallback):
@@ -1411,7 +1419,7 @@ class CheckpointCallback(BaseCallback):
         return True
 
 
-print("\n  V43 Environment and callbacks loaded (FIXED)!")
+print("\n  V44 Environment and callbacks loaded (Position Netting)!")
 print("  755-dimensional observation space")
 print("  Correct green-up P&L formulas")
 print("  In-play detection via 'in_play' column")
@@ -1425,7 +1433,7 @@ print("  Mid-race P&L realization with immediate capital release")
 # ---------------------------------------------------------------------------
 # CELL 4 — Setup Training  (FIX: shuffle before split)
 # ---------------------------------------------------------------------------
-cell_4_src = r'''### CELL 5 - SETUP TRAINING (V43 - FIXED) ###
+cell_4_src = r'''### CELL 5 - SETUP TRAINING (V44 - POSITION NETTING) ###
 
 import random as _rng
 
@@ -1494,17 +1502,17 @@ model = SAC(
 )
 
 print("\n" + "=" * 60)
-print("  V43 Setup complete — ready for training!")
+print("  V44 Setup complete — ready for training!")
 print("=" * 60)
 '''
 
 # ---------------------------------------------------------------------------
-# CELL 5 — Train Model  (FIX: V42 label → V43)
+# CELL 5 — Train Model (V44)
 # ---------------------------------------------------------------------------
 cell_5_src = r'''### CELL 6 - TRAIN MODEL ###
 
 print("=" * 60)
-print("  Starting V43 training run (Green-Up Strategy)")
+print("  Starting V44 training run (Position Netting + Green-Up)")
 print("=" * 60)
 print(f"Training for {CURRICULUM_TOTAL_STEPS:,} steps")
 print(f"Output directory: {BASE_PATH}")
