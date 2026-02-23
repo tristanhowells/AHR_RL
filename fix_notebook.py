@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-fix_notebook.py — Build V44_Green_Up_Position_Netting.ipynb
+fix_notebook.py — Build V43_Green_Up_Complete.ipynb (V44 code)
+
+Writes all V44 code directly into V43_Green_Up_Complete.ipynb so that
+the notebook can be opened on Colab and run as-is.
 
 V44 changes (on top of V43 fixes):
   - Position netting: opposing trades close existing positions, P&L realized immediately
@@ -10,6 +13,9 @@ V44 changes (on top of V43 fixes):
   - Action distribution logging: Back_Trades, Lay_Trades, Back_Exposure, Lay_Exposure
   - Sharpe reward scale 0.01 (from V43 fix)
   - Commission/green_up_pnl passed through info dict (from V43 fix)
+  - Checkpoint resume: find latest saved model, load it, continue training
+  - Diagnostic episode: after loading checkpoint, run one episode with full metrics
+  - Resume-aware callbacks: append to existing CSVs, don't overwrite
 
 V43 fixes included:
   P0-1  Commission rate: read from data (default 0.05)
@@ -39,7 +45,7 @@ import sys
 # Load existing notebook
 # ---------------------------------------------------------------------------
 INPUT_PATH = "V43_Green_Up_Complete.ipynb"
-OUTPUT_PATH = "V44_Green_Up_Position_Netting.ipynb"
+OUTPUT_PATH = "V43_Green_Up_Complete.ipynb"
 
 with open(INPUT_PATH, "rb") as f:
     nb = json.load(f)
@@ -179,7 +185,13 @@ GITHUB_SYNC_BRANCH = 'main'
 GITHUB_SYNC_INTERVAL_EPISODES = 50  # push training metrics every N episodes
 GITHUB_REPO_LOCAL = '/content/AHR_RL_repo'
 
+# ============================================================
+# TRAINING CONTINUATION
+# ============================================================
+CONTINUE_STEPS = 200000  # Additional steps when resuming from checkpoint
+
 print(f"\\n  Configuration loaded for V44 (Position Netting)")
+print(f"   Continue steps (resume): {CONTINUE_STEPS:,}")
 print(f"\\n  Capital: ${MAX_CAPITAL:.0f}")
 print(f"   Commission: {COMMISSION_RATE*100:.0f}% (read from data per-race)")
 print(f"   Reserve ratio: {RESERVE_RATIO*100:.0f}%")
@@ -1204,16 +1216,25 @@ class TrainingMetricsCallback(BaseCallback):
         self.metrics = []
 
         if self.save_path:
-            pd.DataFrame(columns=[
-                'Episode', 'Step', 'Balance', 'Num_Trades', 'Realized_PnL',
-                'Green_Up_PnL', 'Commission_Paid', 'Commission_Rate',
-                'No_Trade_Streak', 'No_Trade_Penalty', 'Had_Trades',
-                'Max_Drawdown', 'MTM_Reward', 'Sharpe_Reward',
-                'Depth_Violations', 'Volatility_Violations',
-                'Stale_Market_Violations', 'Suspended_Violations',
-                'Back_Trades', 'Lay_Trades', 'Back_Exposure', 'Lay_Exposure',
-                'Mid_Race_PnL',
-            ]).to_csv(self.save_path, index=False)
+            if os.path.exists(self.save_path):
+                # Resume: count existing rows, append to existing CSV
+                try:
+                    existing = pd.read_csv(self.save_path)
+                    self.episode_count = len(existing)
+                    print(f"  [METRICS] Resuming training CSV from episode {self.episode_count}")
+                except Exception:
+                    self.episode_count = 0
+            else:
+                pd.DataFrame(columns=[
+                    'Episode', 'Step', 'Balance', 'Num_Trades', 'Realized_PnL',
+                    'Green_Up_PnL', 'Commission_Paid', 'Commission_Rate',
+                    'No_Trade_Streak', 'No_Trade_Penalty', 'Had_Trades',
+                    'Max_Drawdown', 'MTM_Reward', 'Sharpe_Reward',
+                    'Depth_Violations', 'Volatility_Violations',
+                    'Stale_Market_Violations', 'Suspended_Violations',
+                    'Back_Trades', 'Lay_Trades', 'Back_Exposure', 'Lay_Exposure',
+                    'Mid_Race_PnL',
+                ]).to_csv(self.save_path, index=False)
 
     def _on_step(self) -> bool:
         dones = self.locals.get('dones', None)
@@ -1328,15 +1349,18 @@ class ValidationCallback(BaseCallback):
         self.val_metrics = []
 
         if self.save_path:
-            pd.DataFrame(columns=[
-                'Step', 'Val_Episode', 'Num_Trades', 'Realized_PnL',
-                'Final_Balance', 'Commission_Paid', 'Commission_Rate',
-                'MTM_Reward', 'Sharpe_Reward',
-                'Depth_Violations', 'Volatility_Violations',
-                'Stale_Market_Violations', 'Suspended_Violations',
-                'Back_Trades', 'Lay_Trades', 'Back_Exposure', 'Lay_Exposure',
-                'Mid_Race_PnL',
-            ]).to_csv(self.save_path, index=False)
+            if os.path.exists(self.save_path):
+                print(f"  [METRICS] Resuming validation CSV (appending)")
+            else:
+                pd.DataFrame(columns=[
+                    'Step', 'Val_Episode', 'Num_Trades', 'Realized_PnL',
+                    'Final_Balance', 'Commission_Paid', 'Commission_Rate',
+                    'MTM_Reward', 'Sharpe_Reward',
+                    'Depth_Violations', 'Volatility_Violations',
+                    'Stale_Market_Violations', 'Suspended_Violations',
+                    'Back_Trades', 'Lay_Trades', 'Back_Exposure', 'Lay_Exposure',
+                    'Mid_Race_PnL',
+                ]).to_csv(self.save_path, index=False)
 
     def _on_step(self) -> bool:
         if self.num_timesteps % self.val_interval != 0 or self.num_timesteps == 0:
@@ -1516,9 +1540,10 @@ print("  Mid-race P&L realization with immediate capital release")
 # ---------------------------------------------------------------------------
 # CELL 4 — Setup Training  (FIX: shuffle before split)
 # ---------------------------------------------------------------------------
-cell_4_src = r'''### CELL 5 - SETUP TRAINING (V44 - POSITION NETTING) ###
+cell_4_src = r'''### CELL 5 - SETUP TRAINING + CHECKPOINT RESUME ###
 
 import random as _rng
+import glob
 
 # Load race files
 print("\n  Loading race files...")
@@ -1562,7 +1587,6 @@ if GITHUB_SYNC_ENABLED and GITHUB_TOKEN:
             capture_output=True, text=True, timeout=60,
         )
         if result.returncode == 0:
-            # Configure git identity for commits
             subprocess.run(['git', 'config', 'user.email', 'colab@auto.sync'], cwd=GITHUB_REPO_LOCAL, capture_output=True)
             subprocess.run(['git', 'config', 'user.name', 'Colab Training'], cwd=GITHUB_REPO_LOCAL, capture_output=True)
             print(f"  [SYNC] Repo cloned to {GITHUB_REPO_LOCAL}")
@@ -1571,7 +1595,6 @@ if GITHUB_SYNC_ENABLED and GITHUB_TOKEN:
             GITHUB_SYNC_ENABLED = False
     else:
         print(f"  [SYNC] Repo already at {GITHUB_REPO_LOCAL}")
-        # Pull latest
         subprocess.run(['git', 'pull', 'origin', GITHUB_SYNC_BRANCH], cwd=GITHUB_REPO_LOCAL, capture_output=True, timeout=30)
 else:
     if GITHUB_SYNC_ENABLED:
@@ -1593,23 +1616,75 @@ validation_callback = ValidationCallback(
 checkpoint_callback = CheckpointCallback(save_freq=50000, save_path=BASE_PATH)
 callbacks = CallbackList([training_callback, validation_callback, checkpoint_callback])
 
-# SAC model
-print("\n  Creating SAC model...")
-model = SAC(
-    "MlpPolicy",
-    train_env,
-    learning_rate=SAC_LEARNING_RATE,
-    buffer_size=SAC_BUFFER_SIZE,
-    learning_starts=SAC_LEARNING_STARTS,
-    batch_size=SAC_BATCH_SIZE,
-    tau=SAC_TAU,
-    gamma=SAC_GAMMA,
-    train_freq=SAC_TRAIN_FREQ,
-    gradient_steps=SAC_GRADIENT_STEPS,
-    ent_coef=SAC_ENT_COEF,
-    verbose=1,
-    tensorboard_log=f"{BASE_PATH}/logs",
-)
+
+# ============================================================
+# CHECKPOINT RESUME
+# ============================================================
+
+def find_latest_checkpoint(base_path):
+    """Scan base_path for model checkpoint files and return the latest."""
+    checkpoints = glob.glob(os.path.join(base_path, 'model_*.zip'))
+    final_path = os.path.join(base_path, 'final_model.zip')
+
+    if not checkpoints and os.path.exists(final_path):
+        return final_path, -1  # -1 signals "final model"
+
+    if not checkpoints:
+        return None, 0
+
+    def get_step(path):
+        name = os.path.basename(path).replace('.zip', '')
+        try:
+            return int(name.split('_')[1])
+        except (IndexError, ValueError):
+            return 0
+
+    checkpoints.sort(key=get_step)
+    latest = checkpoints[-1]
+    return latest, get_step(latest)
+
+
+checkpoint_path, resume_step = find_latest_checkpoint(BASE_PATH)
+
+if checkpoint_path:
+    print(f"\n{'='*60}")
+    print(f"  CHECKPOINT FOUND — RESUMING")
+    print(f"{'='*60}")
+    print(f"  Checkpoint: {os.path.basename(checkpoint_path)}")
+    print(f"  Resume step: {resume_step if resume_step > 0 else 'final'}")
+
+    model = SAC.load(checkpoint_path, env=train_env)
+
+    # Advance curriculum to resume point (already graduated if past total)
+    if resume_step > 0:
+        curriculum.current_step = resume_step
+    else:
+        curriculum.current_step = CURRICULUM_TOTAL_STEPS
+
+    TRAINING_STEPS = CONTINUE_STEPS
+    RESUME_MODE = True
+    print(f"  {curriculum.get_status_string()}")
+    print(f"  Will train for {CONTINUE_STEPS:,} additional steps")
+    print(f"{'='*60}")
+else:
+    print("\n  No checkpoint found — starting fresh training")
+    model = SAC(
+        "MlpPolicy",
+        train_env,
+        learning_rate=SAC_LEARNING_RATE,
+        buffer_size=SAC_BUFFER_SIZE,
+        learning_starts=SAC_LEARNING_STARTS,
+        batch_size=SAC_BATCH_SIZE,
+        tau=SAC_TAU,
+        gamma=SAC_GAMMA,
+        train_freq=SAC_TRAIN_FREQ,
+        gradient_steps=SAC_GRADIENT_STEPS,
+        ent_coef=SAC_ENT_COEF,
+        verbose=1,
+        tensorboard_log=f"{BASE_PATH}/logs",
+    )
+    TRAINING_STEPS = CURRICULUM_TOTAL_STEPS
+    RESUME_MODE = False
 
 print("\n" + "=" * 60)
 print("  V44 Setup complete — ready for training!")
@@ -1617,20 +1692,141 @@ print("=" * 60)
 '''
 
 # ---------------------------------------------------------------------------
-# CELL 5 — Train Model (V44)
+# CELL 5 — Diagnostic Episode (run one race with full metrics)
 # ---------------------------------------------------------------------------
-cell_5_src = r'''### CELL 6 - TRAIN MODEL ###
+cell_5_src = r'''### CELL 6 - DIAGNOSTIC EPISODE ###
+
+# Run one complete episode and print detailed race info + metrics.
+# Uses the validation env so it doesn't affect training state.
+
+def run_diagnostic_episode(model, env):
+    """Run one episode with deterministic policy and print full diagnostics."""
+    # Unwrap to base MarketMakingEnv
+    actual_env = env
+    while hasattr(actual_env, 'env'):
+        actual_env = actual_env.env
+
+    obs, _ = env.reset()
+
+    # ---- Race metadata ----
+    race_file = actual_env.current_race_file
+    df = actual_env.current_race_df
+    row0 = df.iloc[0]
+
+    print(f"\n{'='*70}")
+    print(f"  DIAGNOSTIC EPISODE — Single Race Deep Dive")
+    print(f"{'='*70}")
+    print(f"  Race File: {os.path.basename(race_file)}")
+
+    # Print any available race metadata columns
+    meta_cols = [
+        'event_name', 'venue', 'market_id', 'race_type', 'race_name',
+        'event_id', 'country_code', 'race_distance', 'race_class',
+        'race_number', 'meeting_name', 'race_time',
+    ]
+    found_meta = False
+    for col in meta_cols:
+        if col in df.columns:
+            val = row0.get(col, None)
+            if val is not None and not pd.isna(val):
+                print(f"  {col}: {val}")
+                found_meta = True
+    if not found_meta:
+        print("  (No race metadata columns found in parquet)")
+
+    print(f"\n  Runners: {actual_env.runner_count}")
+    print(f"  Commission Rate: {actual_env.commission_rate*100:.1f}%")
+    print(f"  Race Length: {len(df)} timesteps")
+
+    # Initial runner prices
+    print(f"\n  Initial Runner Prices:")
+    for ri in range(min(actual_env.runner_count, 24)):
+        rd = get_runner_data(row0, ri)
+        if rd:
+            imp_pct = rd['prob_implied'] * 100
+            print(f"    Runner {ri:2d}: Back {rd['back_1']:7.2f} / Lay {rd['lay_1']:7.2f} | "
+                  f"LTP {rd['ltp']:7.2f} | Implied {imp_pct:5.1f}%")
+
+    # ---- Run episode ----
+    done = False
+    step_count = 0
+    while not done and step_count < 5000:
+        action, _ = model.predict(obs, deterministic=True)
+        obs, reward, done, truncated, info = env.step(action)
+        step_count += 1
+        done = done or truncated
+
+    # ---- Results ----
+    pnl = actual_env.balance - actual_env.initial_balance
+    max_dd = ((actual_env.peak_balance - actual_env.balance) / actual_env.peak_balance * 100) if actual_env.peak_balance > 0 else 0.0
+    total_trades = len(actual_env.trades_this_episode)
+    back_pct = actual_env.back_trades / max(actual_env.back_trades + actual_env.lay_trades, 1) * 100
+
+    print(f"\n  {'—'*50}")
+    print(f"  Episode Complete — {step_count} steps")
+    print(f"  {'—'*50}")
+    print(f"  Final Balance:  ${actual_env.balance:.2f}")
+    print(f"  Realized P&L:   ${pnl:.2f}  {'(WIN)' if pnl > 0 else '(LOSS)' if pnl < 0 else '(FLAT)'}")
+    print(f"  Commission:     ${actual_env.total_commission_paid:.2f}")
+    print(f"  Max Drawdown:   {max_dd:.2f}%")
+    print(f"\n  Trades: {total_trades} total")
+    print(f"    Back: {actual_env.back_trades} | Lay: {actual_env.lay_trades} ({back_pct:.0f}% back)")
+    print(f"    Back Exposure: ${actual_env.back_exposure:.2f}")
+    print(f"    Lay Exposure:  ${actual_env.lay_exposure:.2f}")
+    print(f"  Mid-Race P&L (netting): ${actual_env.mid_race_pnl:.2f}")
+
+    print(f"\n  Violations:")
+    print(f"    Depth: {actual_env.depth_violations} | Volatility: {actual_env.volatility_violations}")
+    print(f"    Stale Market: {actual_env.stale_market_violations} | Suspended: {actual_env.suspended_violations}")
+
+    # Trade log — first 10 and last 10
+    trades = actual_env.trades_this_episode
+    if trades:
+        print(f"\n  Trade Log ({len(trades)} trades):")
+        print(f"    {'Step':>5s}  {'Runner':>6s}  {'Side':>4s}  {'Price':>7s}  {'Stake':>10s}")
+        print(f"    {'—'*40}")
+        show_first = trades[:10]
+        for t in show_first:
+            print(f"    {t['step']:5d}  {t['runner']:6d}  {t['side']:>4s}  {t['price']:7.2f}  ${t['stake']:9.2f}")
+        if len(trades) > 20:
+            print(f"    ... ({len(trades) - 20} trades omitted) ...")
+        if len(trades) > 10:
+            show_last = trades[-10:]
+            for t in show_last:
+                print(f"    {t['step']:5d}  {t['runner']:6d}  {t['side']:>4s}  {t['price']:7.2f}  ${t['stake']:9.2f}")
+    else:
+        print("\n  No trades executed in this episode.")
+
+    print(f"\n{'='*70}")
+    return pnl
+
+
+print("  Running diagnostic episode on validation env...")
+diag_pnl = run_diagnostic_episode(model, val_env)
+print(f"\n  Diagnostic P&L: ${diag_pnl:.2f}")
+print("  Proceeding to training...\n")
+'''
+
+
+# ---------------------------------------------------------------------------
+# CELL 6 — Train / Continue Training
+# ---------------------------------------------------------------------------
+cell_6_src = r'''### CELL 7 - TRAIN / CONTINUE TRAINING ###
 
 print("=" * 60)
-print("  Starting V44 training run (Position Netting + Green-Up)")
-print("=" * 60)
-print(f"Training for {CURRICULUM_TOTAL_STEPS:,} steps")
-print(f"Output directory: {BASE_PATH}")
+if RESUME_MODE:
+    print(f"  CONTINUING V44 training from checkpoint")
+    print(f"  Training for {TRAINING_STEPS:,} additional steps")
+else:
+    print(f"  Starting V44 training run (Position Netting + Green-Up)")
+    print(f"  Training for {TRAINING_STEPS:,} steps")
+print(f"  Output directory: {BASE_PATH}")
 print("=" * 60)
 
 model.learn(
-    total_timesteps=CURRICULUM_TOTAL_STEPS,
+    total_timesteps=TRAINING_STEPS,
     callback=callbacks,
+    reset_num_timesteps=not RESUME_MODE,
     progress_bar=False,
 )
 
@@ -1648,12 +1844,13 @@ print(f"{'='*60}")
 # Assemble notebook
 # ---------------------------------------------------------------------------
 cells = [
-    make_cell("code", cell_0_src),
-    make_cell("code", cell_1_src),
-    make_cell("code", cell_2_src),
-    make_cell("code", cell_3_src),
-    make_cell("code", cell_4_src),
-    make_cell("code", cell_5_src),
+    make_cell("code", cell_0_src),   # Cell 1: Google Drive
+    make_cell("code", cell_1_src),   # Cell 2: Install Dependencies
+    make_cell("code", cell_2_src),   # Cell 3: Configuration
+    make_cell("code", cell_3_src),   # Cell 4: Environment & Training Components
+    make_cell("code", cell_4_src),   # Cell 5: Setup Training + Checkpoint Resume
+    make_cell("code", cell_5_src),   # Cell 6: Diagnostic Episode
+    make_cell("code", cell_6_src),   # Cell 7: Train / Continue Training
 ]
 
 new_nb = {
@@ -1667,5 +1864,5 @@ with open(OUTPUT_PATH, "w") as f:
     json.dump(new_nb, f, indent=1)
 
 print(f"Wrote fixed notebook to {OUTPUT_PATH}")
-print(f"  Cells: {len(cells)} (was 18)")
+print(f"  Cells: {len(cells)} (was 6, added diagnostic episode cell)")
 print(f"  Removed: conflicting Cell 5 redefinitions, diagnostic cells 6-15, empty cell 17")

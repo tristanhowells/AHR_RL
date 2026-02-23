@@ -25,7 +25,7 @@ import pandas as pd
 # Step 0 — Extract and exec cells 2+3 from the fixed notebook so we get
 #           all constants, helpers, and classes in this namespace.
 # ---------------------------------------------------------------------------
-NB_PATH = "/home/user/AHR_RL/V44_Green_Up_Position_Netting.ipynb"
+NB_PATH = "/home/user/AHR_RL/V43_Green_Up_Complete.ipynb"
 PARQUET = "/home/user/AHR_RL/2026-02-13_Newcastle_Race7_1.253949170.parquet"
 
 with open(NB_PATH, "r") as f:
