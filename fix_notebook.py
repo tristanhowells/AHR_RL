@@ -129,7 +129,7 @@ SAC_TAU = 0.005
 SAC_GAMMA = 0.99
 SAC_TRAIN_FREQ = 1
 SAC_GRADIENT_STEPS = 1
-SAC_ENT_COEF = 'auto'
+SAC_ENT_COEF = 0.05
 
 # ============================================================
 # ENVIRONMENT PARAMETERS
