@@ -1338,7 +1338,7 @@ class TrainingMetricsCallback(BaseCallback):
 # ============================================================
 
 class ValidationCallback(BaseCallback):
-    """Periodic validation with rich metrics."""
+    """Periodic validation across ALL validation files for stable metrics."""
 
     def __init__(self, val_env, val_interval=25000, save_path=None, training_csv_path=None):
         super().__init__()
@@ -1347,6 +1347,13 @@ class ValidationCallback(BaseCallback):
         self.save_path = save_path
         self.training_csv_path = training_csv_path
         self.val_metrics = []
+
+        # Get the underlying env and its full list of validation files
+        self._actual_env = self.val_env
+        while hasattr(self._actual_env, 'env'):
+            self._actual_env = self._actual_env.env
+        self._all_val_files = list(self._actual_env.race_files)
+        print(f"  [VALIDATION] Will evaluate all {len(self._all_val_files)} validation files per checkpoint")
 
         if self.save_path:
             if os.path.exists(self.save_path):
@@ -1366,19 +1373,19 @@ class ValidationCallback(BaseCallback):
         if self.num_timesteps % self.val_interval != 0 or self.num_timesteps == 0:
             return True
 
+        n_val = len(self._all_val_files)
         print(f"\n{'='*60}")
-        print(f"  VALIDATION @ {self.num_timesteps:,} steps")
+        print(f"  VALIDATION @ {self.num_timesteps:,} steps ({n_val} episodes)")
         print(f"{'='*60}")
 
         val_results = []
-        for ep in range(10):
+        failed = 0
+        for ep, race_file in enumerate(self._all_val_files):
             try:
+                # Force the env to use this specific race file
+                self._actual_env.race_files = [race_file]
                 obs, _ = self.val_env.reset()
                 done = False
-
-                actual_env = self.val_env
-                while hasattr(actual_env, 'env'):
-                    actual_env = actual_env.env
 
                 steps = 0
                 while not done and steps < 2000:
@@ -1390,26 +1397,31 @@ class ValidationCallback(BaseCallback):
                 result = {
                     'Step': self.num_timesteps,
                     'Val_Episode': ep + 1,
-                    'Num_Trades': len(actual_env.trades_this_episode),
-                    'Realized_PnL': actual_env.balance - actual_env.initial_balance,
-                    'Final_Balance': actual_env.balance,
-                    'Commission_Paid': actual_env.total_commission_paid,
-                    'Commission_Rate': actual_env.commission_rate,
-                    'MTM_Reward': actual_env.total_mtm_reward,
-                    'Sharpe_Reward': actual_env.total_sharpe_reward,
-                    'Depth_Violations': actual_env.depth_violations,
-                    'Volatility_Violations': actual_env.volatility_violations,
-                    'Stale_Market_Violations': actual_env.stale_market_violations,
-                    'Suspended_Violations': actual_env.suspended_violations,
-                    'Back_Trades': actual_env.back_trades,
-                    'Lay_Trades': actual_env.lay_trades,
-                    'Back_Exposure': actual_env.back_exposure,
-                    'Lay_Exposure': actual_env.lay_exposure,
-                    'Mid_Race_PnL': actual_env.mid_race_pnl,
+                    'Num_Trades': len(self._actual_env.trades_this_episode),
+                    'Realized_PnL': self._actual_env.balance - self._actual_env.initial_balance,
+                    'Final_Balance': self._actual_env.balance,
+                    'Commission_Paid': self._actual_env.total_commission_paid,
+                    'Commission_Rate': self._actual_env.commission_rate,
+                    'MTM_Reward': self._actual_env.total_mtm_reward,
+                    'Sharpe_Reward': self._actual_env.total_sharpe_reward,
+                    'Depth_Violations': self._actual_env.depth_violations,
+                    'Volatility_Violations': self._actual_env.volatility_violations,
+                    'Stale_Market_Violations': self._actual_env.stale_market_violations,
+                    'Suspended_Violations': self._actual_env.suspended_violations,
+                    'Back_Trades': self._actual_env.back_trades,
+                    'Lay_Trades': self._actual_env.lay_trades,
+                    'Back_Exposure': self._actual_env.back_exposure,
+                    'Lay_Exposure': self._actual_env.lay_exposure,
+                    'Mid_Race_PnL': self._actual_env.mid_race_pnl,
                 }
                 val_results.append(result)
             except Exception as e:
-                print(f"  Val episode {ep+1} failed: {str(e)[:80]}")
+                failed += 1
+                if failed <= 3:
+                    print(f"  Val episode {ep+1} failed: {str(e)[:80]}")
+
+        # Restore full file list so env works normally after validation
+        self._actual_env.race_files = list(self._all_val_files)
 
         if val_results:
             df = pd.DataFrame(val_results)
@@ -1418,6 +1430,8 @@ class ValidationCallback(BaseCallback):
 
             trade_rate = (df['Num_Trades'] > 0).sum() / len(df) * 100
             mean_pnl = df['Realized_PnL'].mean()
+            median_pnl = df['Realized_PnL'].median()
+            std_pnl = df['Realized_PnL'].std()
             mean_trades = df['Num_Trades'].mean()
             win_rate = (df['Realized_PnL'] > 0).sum() / len(df) * 100
             mean_comm = df['Commission_Paid'].mean()
@@ -1431,8 +1445,9 @@ class ValidationCallback(BaseCallback):
             mean_lay_exp = df['Lay_Exposure'].mean()
             mean_mid_pnl = df['Mid_Race_PnL'].mean()
 
-            print(f"\n  Validation Summary ({len(val_results)} episodes):")
-            print(f"   Mean P&L: ${mean_pnl:.2f} | Mid-Race P&L: ${mean_mid_pnl:.2f} | Win Rate: {win_rate:.0f}%")
+            print(f"\n  Validation Summary ({len(val_results)} episodes, {failed} failed):")
+            print(f"   Mean P&L: ${mean_pnl:.2f} | Median P&L: ${median_pnl:.2f} | Std: ${std_pnl:.2f}")
+            print(f"   Mid-Race P&L: ${mean_mid_pnl:.2f} | Win Rate: {win_rate:.0f}%")
             print(f"   Mean Trades: {mean_trades:.1f} | Trade Rate: {trade_rate:.0f}%")
             print(f"   Back/Lay: {mean_back:.1f}/{mean_lay:.1f} ({back_pct:.0f}% back) | Exp: ${mean_back_exp:.2f}/${mean_lay_exp:.2f}")
             print(f"   Mean Commission: ${mean_comm:.2f}")
