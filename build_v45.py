@@ -6,9 +6,10 @@ Writes all V45 code directly into V45_Green_Up_Complete.ipynb so that
 the notebook can be opened on Colab and run as-is.
 
 V45 changes (on top of V44):
-  - Terminal reward scaled 5x to match MTM reward weight (Change A)
-  - Exposure imbalance penalty: per-step cost when back/lay >70/30 (Change B)
-  - Depth violation penalty: small negative reward per violation (Change C)
+  - Simplified reward: 4 terms only (MTM + Sharpe + Activity + Terminal)
+  - Terminal reward scaled 5x to match MTM weight (was 1x in V44)
+  - Removed exposure imbalance penalty (too weak, destabilized critic)
+  - Removed depth violation penalty (too weak, destabilized critic)
 
 V44 changes:
   - Position netting: opposing trades close existing positions, P&L realized immediately
@@ -174,15 +175,6 @@ SHARPE_REWARD_SCALE = 0.01
 # In V44 terminal was 1x while MTM was 5x, so the agent ignored final P&L.
 TERMINAL_REWARD_SCALE = 5.0
 
-# V45 Change B: Penalize heavily-skewed exposure books per step.
-# Fires when back/lay imbalance exceeds 70/30 split.
-EXPOSURE_IMBALANCE_PENALTY = -0.002
-EXPOSURE_IMBALANCE_THRESHOLD = 0.7
-
-# V45 Change C: Small penalty per depth violation so the agent learns
-# to size orders within available liquidity instead of spraying everywhere.
-DEPTH_VIOLATION_PENALTY = -0.001
-
 # Depth / volatility / staleness constraints
 MIN_DEPTH_RATIO = 0.5
 HIGH_VOLATILITY_THRESHOLD = 0.05
@@ -221,10 +213,8 @@ print(f"   Min depth ratio: {MIN_DEPTH_RATIO*100:.0f}%")
 print(f"   High volatility threshold: {HIGH_VOLATILITY_THRESHOLD}")
 print(f"   Stale market threshold: {STALE_MARKET_THRESHOLD}s")
 print(f"   No-trade penalty cap: {NO_TRADE_PENALTY_CAP}")
-print(f"\\n  V45 Reward Tuning:")
-print(f"   Terminal reward scale: {TERMINAL_REWARD_SCALE}x")
-print(f"   Exposure imbalance penalty: {EXPOSURE_IMBALANCE_PENALTY}/step (threshold: {EXPOSURE_IMBALANCE_THRESHOLD})")
-print(f"   Depth violation penalty: {DEPTH_VIOLATION_PENALTY}/violation")
+print(f"\\n  V45 Reward Tuning (simplified — 4 terms: MTM + Sharpe + Activity + Terminal):")
+print(f"   Terminal reward scale: {TERMINAL_REWARD_SCALE}x (matches MTM scale)")
 print("=" * 60)"""
 
 # ---------------------------------------------------------------------------
@@ -582,11 +572,6 @@ class MarketMakingEnv(gym.Env):
         # Reset mid-race realized P&L
         self.mid_race_pnl = 0.0
 
-        # V45: per-step penalty accumulators
-        self._step_depth_penalty = 0.0
-        self.total_exposure_imbalance_penalty = 0.0
-        self.total_depth_penalty = 0.0
-
         return self._get_observation(), {}
 
     # ------------------------------------------------------------------
@@ -783,8 +768,6 @@ class MarketMakingEnv(gym.Env):
 
                 if intended_stake > total_available * MIN_DEPTH_RATIO:
                     self.depth_violations += 1
-                    # V45 Change C: penalize depth violations
-                    self._step_depth_penalty += DEPTH_VIOLATION_PENALTY
                     continue
 
                 max_safe_stake = total_available * MIN_DEPTH_RATIO
@@ -832,22 +815,7 @@ class MarketMakingEnv(gym.Env):
 
         # FIX: capital preservation bonus removed entirely
         activity_reward = STEP_REWARD_TRADE if trades_executed > 0 else STEP_REWARD_NO_TRADE
-
-        # V45 Change B: exposure imbalance penalty
-        exposure_imbalance_penalty = 0.0
-        total_exp = self.back_exposure + self.lay_exposure
-        if total_exp > 0:
-            imbalance = abs(self.back_exposure - self.lay_exposure) / total_exp
-            if imbalance > EXPOSURE_IMBALANCE_THRESHOLD:
-                exposure_imbalance_penalty = EXPOSURE_IMBALANCE_PENALTY
-                self.total_exposure_imbalance_penalty += exposure_imbalance_penalty
-
-        # V45 Change C: depth violation penalty (accumulated this step)
-        depth_penalty = self._step_depth_penalty
-        self.total_depth_penalty += depth_penalty
-        self._step_depth_penalty = 0.0  # reset for next step
-
-        step_reward = mtm_reward + sharpe_reward + activity_reward + exposure_imbalance_penalty + depth_penalty
+        step_reward = mtm_reward + sharpe_reward + activity_reward
 
         self.previous_mtm_pnl = mtm_after
         self.peak_balance = max(self.peak_balance, self.balance)
@@ -1127,9 +1095,6 @@ class MarketMakingEnv(gym.Env):
             'lay_exposure': self.lay_exposure,
             # Mid-race realized P&L (from position netting)
             'mid_race_pnl': self.mid_race_pnl,
-            # V45: penalty tracking
-            'exposure_imbalance_penalty': self.total_exposure_imbalance_penalty,
-            'depth_penalty': self.total_depth_penalty,
         }
 
     def _build_episode_info(self, total_reward):
@@ -1158,9 +1123,6 @@ class MarketMakingEnv(gym.Env):
             'lay_exposure': self.lay_exposure,
             # Mid-race realized P&L (from position netting)
             'mid_race_pnl': self.mid_race_pnl,
-            # V45: penalty tracking
-            'exposure_imbalance_penalty': self.total_exposure_imbalance_penalty,
-            'depth_penalty': self.total_depth_penalty,
         }
 
 
@@ -1286,7 +1248,6 @@ class TrainingMetricsCallback(BaseCallback):
                     'Stale_Market_Violations', 'Suspended_Violations',
                     'Back_Trades', 'Lay_Trades', 'Back_Exposure', 'Lay_Exposure',
                     'Mid_Race_PnL',
-                    'Exposure_Imbalance_Penalty', 'Depth_Penalty',
                 ]).to_csv(self.save_path, index=False)
 
     def _on_step(self) -> bool:
@@ -1337,8 +1298,6 @@ class TrainingMetricsCallback(BaseCallback):
             'Back_Exposure': info.get('back_exposure', ep.get('back_exposure', 0.0)),
             'Lay_Exposure': info.get('lay_exposure', ep.get('lay_exposure', 0.0)),
             'Mid_Race_PnL': info.get('mid_race_pnl', ep.get('mid_race_pnl', 0.0)),
-            'Exposure_Imbalance_Penalty': info.get('exposure_imbalance_penalty', ep.get('exposure_imbalance_penalty', 0.0)),
-            'Depth_Penalty': info.get('depth_penalty', ep.get('depth_penalty', 0.0)),
         }
         self.metrics.append(metrics)
 
@@ -1422,7 +1381,6 @@ class ValidationCallback(BaseCallback):
                     'Stale_Market_Violations', 'Suspended_Violations',
                     'Back_Trades', 'Lay_Trades', 'Back_Exposure', 'Lay_Exposure',
                     'Mid_Race_PnL',
-                    'Exposure_Imbalance_Penalty', 'Depth_Penalty',
                 ]).to_csv(self.save_path, index=False)
 
     def _on_step(self) -> bool:
@@ -1469,8 +1427,6 @@ class ValidationCallback(BaseCallback):
                     'Back_Exposure': self._actual_env.back_exposure,
                     'Lay_Exposure': self._actual_env.lay_exposure,
                     'Mid_Race_PnL': self._actual_env.mid_race_pnl,
-                    'Exposure_Imbalance_Penalty': self._actual_env.total_exposure_imbalance_penalty,
-                    'Depth_Penalty': self._actual_env.total_depth_penalty,
                 }
                 val_results.append(result)
             except Exception as e:
@@ -1509,9 +1465,8 @@ class ValidationCallback(BaseCallback):
             print(f"   Mean Trades: {mean_trades:.1f} | Trade Rate: {trade_rate:.0f}%")
             print(f"   Back/Lay: {mean_back:.1f}/{mean_lay:.1f} ({back_pct:.0f}% back) | Exp: ${mean_back_exp:.2f}/${mean_lay_exp:.2f}")
             print(f"   Mean Commission: ${mean_comm:.2f}")
-            print(f"   Avg Depth Viol: {df['Depth_Violations'].mean():.1f} | Depth Penalty: {df['Depth_Penalty'].mean():.3f}")
+            print(f"   Avg Depth Viol: {df['Depth_Violations'].mean():.1f}")
             print(f"   Avg Suspended Viol: {df['Suspended_Violations'].mean():.1f}")
-            print(f"   Avg Exposure Imbalance Penalty: {df['Exposure_Imbalance_Penalty'].mean():.3f}")
         else:
             print("  No validation results collected")
 
@@ -1939,4 +1894,4 @@ with open(OUTPUT_PATH, "w") as f:
 
 print(f"Wrote fixed notebook to {OUTPUT_PATH}")
 print(f"  Cells: {len(cells)}")
-print(f"  V45 reward tuning: terminal scale 5x, exposure imbalance penalty, depth violation penalty")
+print(f"  V45 simplified reward: MTM + Sharpe + Activity + Terminal(5x)")
