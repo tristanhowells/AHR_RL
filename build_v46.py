@@ -664,7 +664,8 @@ class MarketMakingEnv(gym.Env):
         # V46: Dense green-up signal — portfolio green-up value visible every step
         # This gives the agent per-step feedback on what it would earn if it
         # closed all positions now, rather than waiting for terminal.
-        green_up_value = self._calculate_green_up_pnl() / MAX_CAPITAL
+        # Uses read-only version to avoid mutating commission accumulator.
+        green_up_value = self._estimate_green_up_pnl() / MAX_CAPITAL
         obs.append(green_up_value)
 
         assert len(obs) == 756, f"Expected 756 dims, got {len(obs)}"
@@ -1008,6 +1009,46 @@ class MarketMakingEnv(gym.Env):
                 commission = runner_pnl * self.commission_rate
                 self.total_commission_paid += commission
                 runner_pnl -= commission
+
+            total_pnl += runner_pnl
+
+        return total_pnl
+
+    # ------------------------------------------------------------------
+    # _estimate_green_up_pnl  (V46: read-only, no side-effects)
+    # Same formula as _calculate_green_up_pnl but does NOT mutate
+    # total_commission_paid.  Used by _get_observation() every step.
+    # ------------------------------------------------------------------
+    def _estimate_green_up_pnl(self):
+        if not self.positions:
+            return 0.0
+
+        total_pnl = 0.0
+        current_row = self.current_race_df.iloc[min(self.step_idx, len(self.current_race_df) - 1)]
+
+        for runner_idx, pos in self.positions.items():
+            runner_data = get_runner_data(current_row, runner_idx)
+            if runner_data is None:
+                continue
+
+            C = runner_data['microprice']
+            if C < 1.01:
+                continue
+
+            back_stake = pos['total_back_stake']
+            wb = pos['weighted_back_price']
+            lay_stake = pos['total_lay_stake']
+            wl = pos['weighted_lay_price']
+
+            runner_pnl = 0.0
+            if back_stake > 0.01 and wb > 1.01:
+                runner_pnl += back_stake * (wb - C) / C
+            if lay_stake > 0.01 and wl > 1.01:
+                runner_pnl += lay_stake * (C - wl) / C
+
+            # Deduct commission estimate but do NOT accumulate it
+            if runner_pnl > 0:
+                runner_pnl *= (1.0 - self.commission_rate)
 
             total_pnl += runner_pnl
 
