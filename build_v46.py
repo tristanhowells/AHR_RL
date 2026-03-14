@@ -176,14 +176,28 @@ Q_VALUE_CLIP_MAX = 20.0
 # ============================================================
 # GITHUB SYNC — auto-push metrics to repo during training
 # ============================================================
-# Set GITHUB_TOKEN to enable. On Colab, use Secrets or paste directly.
-# Example: from google.colab import userdata; GITHUB_TOKEN = userdata.get('GITHUB_TOKEN')
+# Auto-loads GITHUB_TOKEN from Colab Secrets if available, otherwise
+# set it manually below. Token needs repo write access.
 GITHUB_SYNC_ENABLED = True
 GITHUB_REPO = 'tristanhowells/AHR_RL'
-GITHUB_TOKEN = ''  # Set your personal access token here
 GITHUB_SYNC_BRANCH = 'main'
 GITHUB_SYNC_INTERVAL_EPISODES = 50  # push training metrics every N episodes
 GITHUB_REPO_LOCAL = '/content/AHR_RL_repo'
+
+# Try to load token from Colab Secrets automatically
+GITHUB_TOKEN = ''
+try:
+    from google.colab import userdata
+    GITHUB_TOKEN = userdata.get('GITHUB_TOKEN')
+    if GITHUB_TOKEN:
+        print("  [SYNC] GitHub token loaded from Colab Secrets")
+except Exception:
+    pass  # Not on Colab or secret not set
+
+if not GITHUB_TOKEN:
+    GITHUB_TOKEN = ''  # Set manually here if not using Colab Secrets
+    if GITHUB_SYNC_ENABLED:
+        print("  [SYNC] No GITHUB_TOKEN found — add 'GITHUB_TOKEN' to Colab Secrets to enable auto-push")
 
 # ============================================================
 # TRAINING CONTINUATION
@@ -1755,11 +1769,15 @@ class CheckpointCallback(BaseCallback):
 # ============================================================
 
 def sync_metrics_to_github(training_csv_path=None, validation_csv_path=None, message="Update metrics"):
-    """Copy metrics CSVs to local repo clone and push to GitHub."""
+    """Copy metrics CSVs to local repo clone and push to GitHub.
+
+    Retries push up to 4 times with exponential backoff (2s, 4s, 8s, 16s).
+    Always pulls/rebases before pushing to handle remote changes.
+    """
     if not GITHUB_SYNC_ENABLED or not GITHUB_TOKEN:
         return False
 
-    import subprocess, shutil
+    import subprocess, shutil, time
 
     repo_dir = GITHUB_REPO_LOCAL
     if not os.path.isdir(repo_dir):
@@ -1781,25 +1799,30 @@ def sync_metrics_to_github(training_csv_path=None, validation_csv_path=None, mes
             return False
 
         run = lambda cmd: subprocess.run(
-            cmd, cwd=repo_dir, capture_output=True, text=True, timeout=30
+            cmd, cwd=repo_dir, capture_output=True, text=True, timeout=60
         )
+
+        # Pull latest to avoid conflicts
+        run(['git', 'pull', '--rebase', 'origin', GITHUB_SYNC_BRANCH])
+
         run(['git', 'add'] + files_copied)
         result = run(['git', 'commit', '-m', message])
-        if result.returncode != 0 and 'nothing to commit' in result.stdout:
+        if result.returncode != 0 and 'nothing to commit' in (result.stdout + result.stderr):
             return True  # no changes, that's fine
-        push_result = run(['git', 'push', 'origin', GITHUB_SYNC_BRANCH])
-        if push_result.returncode == 0:
-            print(f"  [SYNC] Pushed {', '.join(files_copied)} to GitHub")
-            return True
-        else:
-            # Retry once after pull
-            run(['git', 'pull', '--rebase', 'origin', GITHUB_SYNC_BRANCH])
+
+        # Push with retry + exponential backoff
+        for attempt in range(4):
             push_result = run(['git', 'push', 'origin', GITHUB_SYNC_BRANCH])
             if push_result.returncode == 0:
-                print(f"  [SYNC] Pushed {', '.join(files_copied)} to GitHub (after rebase)")
+                print(f"  [SYNC] Pushed {', '.join(files_copied)} to GitHub")
                 return True
-            print(f"  [SYNC] Push failed: {push_result.stderr[:100]}")
-            return False
+            # Rebase and retry
+            run(['git', 'pull', '--rebase', 'origin', GITHUB_SYNC_BRANCH])
+            wait = 2 ** (attempt + 1)  # 2, 4, 8, 16
+            time.sleep(wait)
+
+        print(f"  [SYNC] Push failed after 4 retries: {push_result.stderr[:100]}")
+        return False
     except Exception as e:
         print(f"  [SYNC] Error: {str(e)[:100]}")
         return False
