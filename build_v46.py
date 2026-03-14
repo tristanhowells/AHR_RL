@@ -1246,35 +1246,221 @@ class QValueClipCallback(BaseCallback):
 
 
 # ============================================================
-# DATA LOADING   (FIX: reads only first row for validation)
+# DATA LOADING   (V46: quality-filtered using inspection criteria)
 # ============================================================
 
+# Suitability criteria — matches inspect_dataset.py CRITERIA dict.
+# A file must pass ALL checks to be used for training.
+SUITABILITY_CRITERIA = {
+    "min_pre_race_secs":            60,
+    "min_pre_race_snapshots":       30,
+    "min_total_matched_at_off":   5_000,
+    "max_fav_spread_pct":           8.0,
+    "min_fav_price_range_pct":      1.0,
+    "min_ob_imbalance_std":         0.10,
+    "result_must_be_closed":        True,
+    "result_winner_must_be_valid":  True,
+    "max_null_rate_prob_implied":   0.30,
+}
+
+
+def _check_file_suitability(filepath):
+    """Run the 9 suitability checks on a single parquet file.
+
+    Returns (suitable: bool, reason: str).
+    This is the inline fallback when _inspection_results.csv is not available.
+    """
+    try:
+        df = pd.read_parquet(filepath)
+    except Exception as e:
+        return False, f"read_error: {e}"
+
+    if len(df) < 10 or 'run[0].back_price_1' not in df.columns:
+        return False, "too_short_or_missing_columns"
+
+    c = SUITABILITY_CRITERIA
+    r0 = df.iloc[0]
+    n_runners = int(r0.get("runner_count", 0))
+    if n_runners == 0:
+        return False, "no_runners"
+
+    # --- Split pre-race / in-play ---
+    pre = df[df["in_play"] == 0] if "in_play" in df.columns else df
+
+    # 1. Pre-race window duration
+    if len(pre) >= 2:
+        pre_dur = (pre["ts_unix"].max() - pre["ts_unix"].min()) / 1000
+    else:
+        pre_dur = 0.0
+    if pre_dur < c["min_pre_race_secs"]:
+        return False, "pre_race_window_too_short"
+
+    # 2. Pre-race snapshot count
+    if len(pre) < c["min_pre_race_snapshots"]:
+        return False, "too_few_pre_race_snapshots"
+
+    # 3. Liquidity at off
+    if "total_matched_market" in df.columns and len(pre) > 0:
+        matched_at_off = float(pre["total_matched_market"].iloc[-1])
+    else:
+        matched_at_off = 0.0
+    if matched_at_off < c["min_total_matched_at_off"]:
+        return False, "low_liquidity"
+
+    # 4 & 5. Favourite spread + price drift
+    fav_idx, fav_start_price = None, None
+    if len(pre) > 0:
+        first_row = pre.iloc[0]
+        best_bp = np.inf
+        for i in range(n_runners):
+            bp_col = f"run[{i}].back_price_1"
+            if bp_col in df.columns:
+                bp = first_row.get(bp_col, np.nan)
+                if pd.notna(bp) and 1.0 < bp < best_bp:
+                    best_bp, fav_idx = bp, i
+        if fav_idx is not None:
+            fav_start_price = best_bp
+
+    if fav_idx is None:
+        return False, "no_favourite_found"
+
+    bp_col = f"run[{fav_idx}].back_price_1"
+    lp_col = f"run[{fav_idx}].lay_price_1"
+
+    # Fav spread (sampled every 10th row for speed)
+    spread_vals = []
+    for idx in range(0, len(pre), max(1, len(pre) // 50)):
+        row = pre.iloc[idx]
+        bp = row.get(bp_col, np.nan)
+        lp = row.get(lp_col, np.nan)
+        if pd.notna(bp) and pd.notna(lp) and bp > 0 and lp > bp:
+            spread_vals.append((lp - bp) / bp * 100)
+    fav_spread_mean = np.mean(spread_vals) if spread_vals else np.nan
+    if pd.isna(fav_spread_mean) or fav_spread_mean > c["max_fav_spread_pct"]:
+        return False, "fav_spread_too_wide"
+
+    # Fav price drift
+    fav_end = pre.iloc[-1].get(bp_col, np.nan)
+    if pd.notna(fav_start_price) and pd.notna(fav_end) and fav_start_price > 0:
+        drift_pct = abs(fav_end - fav_start_price) / fav_start_price * 100
+    else:
+        drift_pct = 0.0
+    if drift_pct < c["min_fav_price_range_pct"]:
+        return False, "fav_price_no_signal"
+
+    # 6. Order-book imbalance signal
+    ob_stds = []
+    for i in range(n_runners):
+        ob_col = f"run[{i}].ob_imbalance"
+        if ob_col in pre.columns:
+            s = pre[ob_col].dropna()
+            if len(s) > 1:
+                ob_stds.append(s.std())
+    ob_mean_std = np.mean(ob_stds) if ob_stds else 0.0
+    if ob_mean_std < c["min_ob_imbalance_std"]:
+        return False, "ob_imbalance_flat"
+
+    # 7. Result closed
+    last = df.iloc[-1]
+    result_closed = bool(int(last.get("result_closed", 0)))
+    if result_closed != c["result_must_be_closed"]:
+        return False, "result_not_closed"
+
+    # 8. Winner valid
+    winner_idx = last.get("result_winner_idx_first", np.nan)
+    winner_selids = str(last.get("result_winner_selids", "")).strip()
+    if result_closed:
+        winner_valid = (
+            pd.notna(winner_idx)
+            and int(winner_idx) != -1
+            and winner_selids != ""
+        )
+        if not winner_valid:
+            return False, "winner_invalid"
+
+    # 9. Prob implied null rate
+    prob_cols = [f"run[{i}].prob_implied" for i in range(n_runners)
+                 if f"run[{i}].prob_implied" in df.columns]
+    if prob_cols and len(pre) > 0:
+        null_rate = float(pre[prob_cols].isna().mean().mean())
+    else:
+        null_rate = 1.0
+    if null_rate > c["max_null_rate_prob_implied"]:
+        return False, "prob_implied_too_null"
+
+    return True, "passed_all_9_checks"
+
+
 def load_race_files(data_dir):
-    """Load all parquet files with lightweight validation."""
-    race_files = []
-    skipped = 0
+    """Load parquet files filtered by suitability criteria.
+
+    Fast path: if _inspection_results.csv exists in data_dir, use its
+    is_suitable column as a whitelist (instant filtering).
+
+    Fallback: run the 9 suitability checks inline on each file (slower
+    but works without pre-computed inspection results).
+    """
+    import csv as _csv
 
     print(f"\n[DATA] Loading parquet files from: {data_dir}")
+
+    # --- Fast path: use pre-computed inspection results ---
+    inspection_csv = os.path.join(data_dir, '_inspection_results.csv')
+    if os.path.exists(inspection_csv):
+        print(f"[DATA] Found _inspection_results.csv — using as quality whitelist")
+        suitable_files = set()
+        total_inspected = 0
+        with open(inspection_csv) as f:
+            reader = _csv.DictReader(f)
+            for row in reader:
+                total_inspected += 1
+                if row.get('is_suitable', '').strip() == 'True':
+                    suitable_files.add(row['file'])
+
+        race_files = []
+        skipped = 0
+        for file in sorted(os.listdir(data_dir)):
+            if not file.endswith('.parquet'):
+                continue
+            if file in suitable_files:
+                race_files.append(os.path.join(data_dir, file))
+            else:
+                skipped += 1
+
+        print(f"[DATA] Inspection CSV: {total_inspected} inspected, "
+              f"{len(suitable_files)} suitable")
+        print(f"[DATA] Loaded {len(race_files)} suitable race files "
+              f"(filtered out {skipped})")
+        if not race_files:
+            raise RuntimeError("No suitable race files found! "
+                               "Check _inspection_results.csv criteria.")
+        return race_files
+
+    # --- Fallback: run inline suitability checks ---
+    print(f"[DATA] No _inspection_results.csv found — running inline checks")
+    race_files = []
+    skipped = 0
+    reasons = {}
 
     for file in sorted(os.listdir(data_dir)):
         if not file.endswith('.parquet'):
             continue
         filepath = os.path.join(data_dir, file)
-        try:
-            df = pd.read_parquet(filepath)
-            if len(df) < 10:
-                skipped += 1
-                continue
-            if 'run[0].back_price_1' not in df.columns:
-                skipped += 1
-                continue
+        suitable, reason = _check_file_suitability(filepath)
+        if suitable:
             race_files.append(filepath)
-        except Exception:
+        else:
             skipped += 1
+            reasons[reason] = reasons.get(reason, 0) + 1
 
-    print(f"[DATA] Loaded {len(race_files)} valid race files (skipped {skipped})")
+    print(f"[DATA] Loaded {len(race_files)} suitable race files "
+          f"(filtered out {skipped})")
+    if reasons:
+        print(f"[DATA] Filter reasons:")
+        for reason, count in sorted(reasons.items(), key=lambda x: -x[1]):
+            print(f"       {reason}: {count}")
     if not race_files:
-        raise RuntimeError("No valid race files found!")
+        raise RuntimeError("No suitable race files found!")
     return race_files
 
 
