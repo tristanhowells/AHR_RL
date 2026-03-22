@@ -20,13 +20,13 @@ V48 changes (on top of V47):
     incentive to find profitable strategies. The bonus breaks symmetry
     and reinforces winning episodes.
   - All V47 features retained: TD target clipping, SAC metrics logging,
-    dense green-up, position netting, curriculum learning, 756-dim obs.
+    dense green-up, position netting, curriculum learning, 903-dim obs.
 
 V47 base:
   - Critic stabilization (TD target clipping [-20,+20])
   - Entropy cap at 0.5
   - SAC internal metrics logging
-  - 756-dimensional observation space
+  - 903-dimensional observation space (756 base + 144 runner deltas + 3 global temporal)
   - All V43/V44/V45/V46 fixes included
 """
 
@@ -96,7 +96,7 @@ cell_2_src = """\
 ### CELL 3 - CONFIGURATION (V48 - ENTROPY FLOOR + STALE PENALTY + GREEN BONUS) ###
 
 # V48: Entropy floor, stale-market penalty, green episode bonus
-# 756-dimensional observation space (+1 portfolio green-up value)
+# 903-dimensional observation space (37 features/runner + 14 global + 1 green-up)
 
 print("=" * 60)
 print("V48 Configuration - Entropy Floor + Stale Penalty + Green Bonus")
@@ -238,7 +238,10 @@ print(f"   Green episode bonus: +{GREEN_EPISODE_BONUS} terminal reward for profi
 print(f"\\n  V47 Retained:")
 print(f"   TD target clip: [{Q_VALUE_CLIP_MIN}, {Q_VALUE_CLIP_MAX}]")
 print(f"   SAC tau: {SAC_TAU} | SAC metrics logged to CSV")
-print(f"   Observation space: 756 dims (+1 portfolio green-up)")
+print(f"   Observation space: 903 dims (37/runner + 14 global + 1 green-up)")
+print(f"\\n  Temporal features (V48):")
+print(f"   Per-runner: microprice_delta_1/5, ob_imbalance_delta, vol_60s_delta, ret_mean_5s, spread_delta")
+print(f"   Global: secs_to_off, total_matched_market, prob_entropy")
 print(f"\\n  Reward: MTM + Sharpe + Activity + Terminal(5x) + StalePenalty + GreenBonus")
 print(f"   Terminal reward scale: {TERMINAL_REWARD_SCALE}x (matches MTM scale)")
 print("=" * 60)"""
@@ -555,14 +558,21 @@ class CurriculumTracker:
 # ============================================================
 
 class MarketMakingEnv(gym.Env):
-    """V48: 756-dim obs + stale-market penalty + green episode bonus."""
+    """V48: 903-dim obs with temporal features + stale penalty + green bonus."""
 
     metadata = {'render_modes': ['human']}
+
+    # V48: Observation dimensions
+    FEATURES_PER_RUNNER = 37   # 31 original + 6 temporal deltas
+    NUM_RUNNERS = 24
+    GLOBAL_FEATURES = 14       # 11 original + 3 new (secs_to_off, matched_market, entropy)
+    GREEN_UP_FEATURES = 1
+    OBS_DIM = NUM_RUNNERS * FEATURES_PER_RUNNER + GLOBAL_FEATURES + GREEN_UP_FEATURES  # 903
 
     def __init__(self, race_files, curriculum_tracker=None):
         super().__init__()
 
-        print(f"\n[ENV INIT] V48 Entropy Floor + Stale Penalty + Green Bonus (756 dimensions)")
+        print(f"\n[ENV INIT] V48 with temporal features ({self.OBS_DIM} dimensions)")
 
         self.race_files = list(race_files)  # FIX: own copy so removals don't shrink shared list
         self.curriculum_tracker = curriculum_tracker
@@ -571,9 +581,9 @@ class MarketMakingEnv(gym.Env):
         self.action_space = spaces.Box(
             low=-1.0, high=1.0, shape=(25,), dtype=np.float32
         )
-        # 24 runners x 31 features + 11 global + 1 green-up = 756
+        # V48: 24 runners x 37 features + 14 global + 1 green-up = 903
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(756,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(self.OBS_DIM,), dtype=np.float32
         )
 
         # Episode state
@@ -595,6 +605,10 @@ class MarketMakingEnv(gym.Env):
         self.trades_this_episode = []
         self.trades_last_10_steps = deque(maxlen=10)
         self.price_history = deque(maxlen=20)
+
+        # V48: Per-runner history for temporal delta features
+        # Each entry is a dict: {runner_idx: {microprice, ob_imbalance, traded_vol_60s, rel_spread}}
+        self.runner_history = deque(maxlen=10)  # last 10 steps
 
         # MTM / Sharpe tracking
         self.previous_mtm_pnl = 0.0
@@ -655,6 +669,9 @@ class MarketMakingEnv(gym.Env):
         self.trades_last_10_steps.clear()
         self.price_history.clear()
 
+        # V48: Clear per-runner history for delta features
+        self.runner_history.clear()
+
         # FIX: Read per-race commission from data (default to global constant)
         row0 = self.current_race_df.iloc[0]
         cr = row0.get('commission_rate', None)
@@ -689,15 +706,30 @@ class MarketMakingEnv(gym.Env):
         return self._get_observation(), {}
 
     # ------------------------------------------------------------------
-    # _get_observation  (756 dims — V46: +1 dense green-up)
+    # _get_observation  (V48: 903 dims — 37/runner + 14 global + 1 green-up)
     # ------------------------------------------------------------------
     def _get_observation(self):
-        """Build 756-dimensional observation.  24 runners x 31 features + 11 global + 1 green-up."""
+        """Build 903-dimensional observation.
+        24 runners x 37 features + 14 global + 1 green-up.
+
+        V48 adds 6 per-runner temporal delta features:
+          microprice_delta_1, microprice_delta_5, ob_imbalance_delta,
+          traded_vol_60s_delta, ret_mean_5s, spread_delta
+        And 3 global temporal features:
+          secs_to_off, total_matched_market, prob_entropy
+        """
         if self.step_idx >= len(self.current_race_df):
-            return np.zeros(756, dtype=np.float32)
+            return np.zeros(self.OBS_DIM, dtype=np.float32)
 
         row = self.current_race_df.iloc[self.step_idx]
         obs = []
+
+        # V48: Snapshot current runner data for history tracking
+        current_snapshot = {}
+
+        # Get previous snapshots for delta computation
+        prev_1 = self.runner_history[-1] if len(self.runner_history) >= 1 else {}
+        prev_5 = self.runner_history[-5] if len(self.runner_history) >= 5 else {}
 
         for runner_idx in range(24):
             if runner_idx < self.runner_count:
@@ -749,7 +781,67 @@ class MarketMakingEnv(gym.Env):
                     net_position = self._get_net_position_stake(runner_idx) / MAX_CAPITAL
                     position_pnl = self._get_position_pnl(runner_idx, runner_data['microprice']) / MAX_CAPITAL
 
-                    # 31 features per runner (4+4+4+4+2+4+3+3+1+2 = 31)
+                    # --- V48: Temporal delta features (6) ---
+                    raw_microprice = runner_data['microprice']
+                    raw_ob_imbalance = runner_data['ob_imbalance']
+                    raw_vol_60s = runner_data['traded_vol_60s']
+                    raw_spread = runner_data['rel_spread']
+
+                    # Store for history
+                    current_snapshot[runner_idx] = {
+                        'microprice': raw_microprice,
+                        'ob_imbalance': raw_ob_imbalance,
+                        'traded_vol_60s': raw_vol_60s,
+                        'rel_spread': raw_spread,
+                    }
+
+                    # 1. microprice_delta_1: 1-step price momentum
+                    prev_1_data = prev_1.get(runner_idx, None)
+                    if prev_1_data and prev_1_data['microprice'] > 1.01:
+                        microprice_delta_1 = (raw_microprice - prev_1_data['microprice']) / prev_1_data['microprice']
+                    else:
+                        microprice_delta_1 = 0.0
+                    microprice_delta_1 = float(np.clip(microprice_delta_1, -0.2, 0.2))
+
+                    # 2. microprice_delta_5: 5-step price momentum (medium-term)
+                    prev_5_data = prev_5.get(runner_idx, None)
+                    if prev_5_data and prev_5_data['microprice'] > 1.01:
+                        microprice_delta_5 = (raw_microprice - prev_5_data['microprice']) / prev_5_data['microprice']
+                    else:
+                        microprice_delta_5 = 0.0
+                    microprice_delta_5 = float(np.clip(microprice_delta_5, -0.5, 0.5))
+
+                    # 3. ob_imbalance_delta: change in order book pressure
+                    if prev_1_data:
+                        ob_imbalance_delta = raw_ob_imbalance - prev_1_data['ob_imbalance']
+                    else:
+                        ob_imbalance_delta = 0.0
+                    ob_imbalance_delta = float(np.clip(ob_imbalance_delta, -1.0, 1.0))
+
+                    # 4. traded_vol_60s_delta: volume acceleration
+                    if prev_1_data and prev_1_data['traded_vol_60s'] > 0:
+                        vol_60s_delta = (raw_vol_60s - prev_1_data['traded_vol_60s']) / max(prev_1_data['traded_vol_60s'], 1.0)
+                    else:
+                        vol_60s_delta = 0.0
+                    vol_60s_delta = float(np.clip(vol_60s_delta, -2.0, 2.0))
+
+                    # 5. ret_mean_5s: directional return signal (computed from 5-step history)
+                    #    Positive = price rising, negative = price falling
+                    if prev_5_data and prev_5_data['microprice'] > 1.01 and raw_microprice > 1.01:
+                        # Average per-step return over last 5 steps
+                        ret_mean_5s = microprice_delta_5 / 5.0
+                    else:
+                        ret_mean_5s = 0.0
+                    ret_mean_5s = float(np.clip(ret_mean_5s, -0.1, 0.1))
+
+                    # 6. spread_delta: spread change (tightening = more liquidity arriving)
+                    if prev_1_data:
+                        spread_delta = raw_spread - prev_1_data['rel_spread']
+                    else:
+                        spread_delta = 0.0
+                    spread_delta = float(np.clip(spread_delta, -0.05, 0.05))
+
+                    # 37 features per runner (31 original + 6 temporal)
                     obs.extend([
                         back_1, lay_1, back_vol_1, lay_vol_1,          # L1 prices+vols (4)
                         back_2, lay_2, back_vol_2, lay_vol_2,          # L2 prices+vols (4)
@@ -761,13 +853,23 @@ class MarketMakingEnv(gym.Env):
                         total_back_liq_norm, total_lay_liq_norm, depth_concentration,  # Depth (3)
                         vol_accel_norm,                                # Vol accel (1)
                         net_position, position_pnl,                    # Position (2)
+                        # V48: Temporal deltas (6)
+                        microprice_delta_1,                            # 1-step momentum
+                        microprice_delta_5,                            # 5-step momentum
+                        ob_imbalance_delta,                            # OB pressure change
+                        vol_60s_delta,                                 # Volume acceleration
+                        ret_mean_5s,                                   # Directional return
+                        spread_delta,                                  # Spread change
                     ])
                 else:
-                    obs.extend([0.0] * 31)
+                    obs.extend([0.0] * self.FEATURES_PER_RUNNER)
             else:
-                obs.extend([0.0] * 31)
+                obs.extend([0.0] * self.FEATURES_PER_RUNNER)
 
-        # GLOBAL FEATURES (11)
+        # V48: Record current snapshot for next step's delta computation
+        self.runner_history.append(current_snapshot)
+
+        # GLOBAL FEATURES (14 = 11 original + 3 V48 temporal)
         current_exposure = self._get_total_exposure()
         available_capital = max(0.0, self.balance - current_exposure)
         portfolio_mtm = self._get_total_unrealized_pnl()
@@ -785,14 +887,29 @@ class MarketMakingEnv(gym.Env):
             portfolio_mtm / MAX_CAPITAL,
         ])
 
+        # V48: 3 new global temporal features from parquet
+        # 1. secs_to_off — countdown to race start (strong temporal signal)
+        secs_to_off_raw = to_float(row.get('secs_to_off', 0.0), 0.0)
+        # Normalize: log-scale, races typically 60-3600s before off
+        secs_to_off_norm = safe_log_norm(max(0.0, secs_to_off_raw)) / safe_log_norm(3600.0)
+        obs.append(float(np.clip(secs_to_off_norm, 0.0, 1.5)))
+
+        # 2. total_matched_market — market-wide cumulative volume
+        total_matched = to_float(row.get('total_matched_market', 0.0), 0.0)
+        total_matched_norm = safe_log_norm(total_matched) / safe_log_norm(1_000_000.0)
+        obs.append(float(np.clip(total_matched_norm, 0.0, 1.5)))
+
+        # 3. prob_entropy — market uncertainty (higher = more uncertain)
+        prob_entropy = to_float(row.get('prob_entropy', 0.0), 0.0)
+        # Entropy of a 24-runner uniform dist is ln(24) ≈ 3.18
+        prob_entropy_norm = safe_normalize(prob_entropy, 0.0, 3.2)
+        obs.append(prob_entropy_norm)
+
         # V46: Dense green-up signal — portfolio green-up value visible every step
-        # This gives the agent per-step feedback on what it would earn if it
-        # closed all positions now, rather than waiting for terminal.
-        # Uses read-only version to avoid mutating commission accumulator.
         green_up_value = self._estimate_green_up_pnl() / MAX_CAPITAL
         obs.append(green_up_value)
 
-        assert len(obs) == 756, f"Expected 756 dims, got {len(obs)}"
+        assert len(obs) == self.OBS_DIM, f"Expected {self.OBS_DIM} dims, got {len(obs)}"
         return np.array(obs, dtype=np.float32)
 
     # ------------------------------------------------------------------
@@ -1928,13 +2045,13 @@ def sync_metrics_to_github(training_csv_path=None, validation_csv_path=None, mes
     try:
         files_copied = []
         if training_csv_path and os.path.exists(training_csv_path):
-            dst = os.path.join(repo_dir, 'training_metrics.csv')
+            dst = os.path.join(repo_dir, 'training_metrics_v48.csv')
             shutil.copy2(training_csv_path, dst)
-            files_copied.append('training_metrics.csv')
+            files_copied.append('training_metrics_v48.csv')
         if validation_csv_path and os.path.exists(validation_csv_path):
-            dst = os.path.join(repo_dir, 'validation_metrics.csv')
+            dst = os.path.join(repo_dir, 'validation_metrics_v48.csv')
             shutil.copy2(validation_csv_path, dst)
-            files_copied.append('validation_metrics.csv')
+            files_copied.append('validation_metrics_v48.csv')
 
         if not files_copied:
             return False
@@ -1970,7 +2087,9 @@ def sync_metrics_to_github(training_csv_path=None, validation_csv_path=None, mes
 
 
 print("\n  V48 Environment and callbacks loaded!")
-print("  756-dimensional observation space (+1 dense green-up)")
+print("  903-dimensional observation space (37/runner + 14 global + 1 green-up)")
+print("  Temporal features: price momentum, OB pressure delta, volume accel, spread delta")
+print("  Global temporal: secs_to_off, total_matched_market, prob_entropy")
 print("  TD target clipping via ClippedTDTargetSAC subclass")
 print(f"  Entropy coefficient: floor={SAC_ENT_COEF_MIN}, cap={SAC_ENT_COEF_MAX}")
 print(f"  Stale-market penalty: {STALE_TRADE_PENALTY} per attempted stale trade")
@@ -2012,7 +2131,7 @@ print("\n  Creating environments...")
 train_env = MarketMakingEnv(train_files, curriculum_tracker=curriculum)
 train_env = Monitor(train_env)
 train_env = NoTradeStreakWrapper(train_env)
-print("  Training env: NoTradeStreakWrapper -> Monitor -> MarketMakingEnv (756 dims, V48)")
+print("  Training env: NoTradeStreakWrapper -> Monitor -> MarketMakingEnv (903 dims, V48)")
 
 val_env = MarketMakingEnv(val_files, curriculum_tracker=None)
 val_env = Monitor(val_env)
@@ -2046,14 +2165,14 @@ else:
 print("\n  Setting up callbacks...")
 training_callback = TrainingMetricsCallback(
     log_interval=1,
-    save_path=f"{BASE_PATH}/training_metrics.csv",
+    save_path=f"{BASE_PATH}/training_metrics_v48.csv",
     curriculum_tracker=curriculum,
 )
 validation_callback = ValidationCallback(
     val_env=val_env,
     val_interval=50000,
-    save_path=f"{BASE_PATH}/validation_metrics.csv",
-    training_csv_path=f"{BASE_PATH}/training_metrics.csv",
+    save_path=f"{BASE_PATH}/validation_metrics_v48.csv",
+    training_csv_path=f"{BASE_PATH}/training_metrics_v48.csv",
 )
 checkpoint_callback = CheckpointCallback(save_freq=100000, save_path=BASE_PATH)
 # V47: Q-value clipping is now in ClippedTDTargetSAC, not a callback
@@ -2322,4 +2441,4 @@ with open(OUTPUT_PATH, "w") as f:
 
 print(f"Wrote notebook to {OUTPUT_PATH}")
 print(f"  Cells: {len(cells)}")
-print(f"  V48: Entropy floor + stale penalty + green bonus (756 dims)")
+print(f"  V48: Entropy floor + stale penalty + green bonus + temporal features (903 dims)")
