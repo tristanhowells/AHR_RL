@@ -2208,13 +2208,13 @@ class PeriodicResetCallback(BaseCallback):
             model.actor.log_std.reset_parameters()
 
         # Reset both critic networks
-        for net in model.critic.networks:
+        for net in [model.critic.qf0, model.critic.qf1]:
             for module in net.modules():
                 if hasattr(module, 'reset_parameters'):
                     module.reset_parameters()
 
         # Reset critic target to match freshly reset critic
-        for net in model.critic_target.networks:
+        for net in [model.critic_target.qf0, model.critic_target.qf1]:
             for module in net.modules():
                 if hasattr(module, 'reset_parameters'):
                     module.reset_parameters()
