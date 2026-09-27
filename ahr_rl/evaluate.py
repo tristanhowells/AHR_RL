@@ -17,8 +17,8 @@ def run_episode(env: BetfairPreRaceEnv, tape, policy_fn) -> dict:
     return info
 
 
-def evaluate(policy_fn, tapes: list, cfg: EnvConfig | None = None) -> pd.DataFrame:
-    env = BetfairPreRaceEnv(tapes, cfg, cache_tapes=False)
+def evaluate(policy_fn, tapes: list, cfg: EnvConfig | None = None, env_cls=BetfairPreRaceEnv) -> pd.DataFrame:
+    env = env_cls(tapes, cfg, cache_tapes=False)
     rows = [run_episode(env, t, policy_fn) for t in tapes]
     cols = ["market", "worst", "expected", "realised", "best", "green", "void", "turnover", "n_fills",
             "n_rejected", "n_opens", "n_closes", "n_stops"]
