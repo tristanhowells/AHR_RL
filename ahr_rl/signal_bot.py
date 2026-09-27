@@ -146,11 +146,13 @@ _W = {}
 
 
 def _init_worker(bundle_path):
-    # one thread per worker: N processes x N OpenMP threads thrashes the CPU
+    # one thread per worker: N processes x N OpenMP threads spin-wait and thrash.
+    # OMP_NUM_THREADS is also set before the pool starts; the limit is re-applied
+    # after unpickling because that is when sklearn's OpenMP runtime loads.
     from threadpoolctl import threadpool_limits
-    _W["limits"] = threadpool_limits(1)
     with open(bundle_path, "rb") as fh:
         _W["bundle"] = pickle.load(fh)
+    _W["limits"] = threadpool_limits(1)
 
 
 def _run_one(args):
@@ -220,6 +222,7 @@ def main(argv=None):
     # "spawn", not fork: the parent has already run OpenMP (GBM training) and
     # forking after that deadlocks the workers' OpenMP runtime
     import multiprocessing as mp
+    os.environ["OMP_NUM_THREADS"] = "1"  # inherited by the spawned workers
     with ProcessPoolExecutor(a.workers, mp_context=mp.get_context("spawn"), initializer=_init_worker,
                              initargs=(bpath,)) as pool:
         for H in horizons:
