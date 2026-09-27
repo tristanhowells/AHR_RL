@@ -146,6 +146,9 @@ _W = {}
 
 
 def _init_worker(bundle_path):
+    # one thread per worker: N processes x N OpenMP threads thrashes the CPU
+    from threadpoolctl import threadpool_limits
+    _W["limits"] = threadpool_limits(1)
     with open(bundle_path, "rb") as fh:
         _W["bundle"] = pickle.load(fh)
 
@@ -214,7 +217,11 @@ def main(argv=None):
 
     pd.set_option("display.width", 220)
     rows = []
-    with ProcessPoolExecutor(a.workers, initializer=_init_worker, initargs=(bpath,)) as pool:
+    # "spawn", not fork: the parent has already run OpenMP (GBM training) and
+    # forking after that deadlocks the workers' OpenMP runtime
+    import multiprocessing as mp
+    with ProcessPoolExecutor(a.workers, mp_context=mp.get_context("spawn"), initializer=_init_worker,
+                             initargs=(bpath,)) as pool:
         for H in horizons:
             for q in qs:
                 t1 = time.time()
