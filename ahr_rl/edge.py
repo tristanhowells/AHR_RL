@@ -55,6 +55,27 @@ TARGETS = TRADES + ("mid", "mid_ticks")
 POSITION_FEATURES = list(range(22, 31)) + list(range(34, 38))
 
 
+def feature_record(F, g, micro, s: int, r: int) -> dict:
+    """Model inputs for runner r at step s. Shared with the signal bot so live /
+    simulated decisions see exactly the columns the models were trained on."""
+    rec = {}
+    for i in range(N_RUNNER_FEATURES):
+        if i not in POSITION_FEATURES:
+            rec[f"r{i}"] = F[r, i]
+    if micro is not None:
+        for name_, arr in micro.items():
+            rec[f"x_{name_}"] = arr[s, r]
+    for i in range(N_GLOBAL_FEATURES):
+        if i not in (6, 7, 8, 11):  # funds / P&L / fills: always constant here
+            rec[f"g{i}"] = g[i]
+    return rec
+
+
+def tradeable(t, s: int, r: int, max_spread_ticks: int = 3, max_price: float = 30.0) -> bool:
+    bb, bl = int(t.back_tick[s, r, 0]), int(t.lay_tick[s, r, 0])
+    return bb >= 0 and bl >= 0 and bl - bb <= max_spread_ticks and PRICES[bl] <= max_price
+
+
 def build_samples(path: str, horizons_s=(10, 30, 60), every_s: float = 2.0, exit_cutoff_s: float = 0.0,
                   min_size: float = 5.0, max_spread_ticks: int = 3, max_price: float = 30.0,
                   extended: bool = False) -> pd.DataFrame | None:
@@ -126,15 +147,7 @@ def build_samples(path: str, horizons_s=(10, 30, 60), every_s: float = 2.0, exit
                 any_target = True
             if not any_target:
                 continue
-            for i in range(N_RUNNER_FEATURES):
-                if i not in POSITION_FEATURES:
-                    rec[f"r{i}"] = F[r, i]
-            if micro is not None:
-                for name_, arr in micro.items():
-                    rec[f"x_{name_}"] = arr[s, r]
-            for i in range(N_GLOBAL_FEATURES):
-                if i not in (6, 7, 8, 11):  # funds / P&L / fills: always constant here
-                    rec[f"g{i}"] = g[i]
+            rec.update(feature_record(F, g, micro, s, r))
             rows.append(rec)
     return pd.DataFrame(rows) if rows else None
 
