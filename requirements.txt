@@ -7,3 +7,5 @@ orjson
 pytest
 # live trading only
 betfairlightweight>=2.20
+scikit-learn
+scipy
