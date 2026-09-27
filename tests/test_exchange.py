@@ -161,3 +161,27 @@ def test_removal_reduction_factor_and_void():
     assert ex.bet_price[0] == pytest.approx(8.0)  # 10 * (1 - 0.2)
     assert ex.W[2] == 0 and ex.L[2] == 0
     assert ex.W[0] == pytest.approx(70.0)
+
+
+def test_fill_modes_queue_and_touch():
+    # 10 already queued at 4.2; 3 trades at 4.2 in the interval after we go live
+    trades = [(2, 0, 4.2, 3.0)]
+    for mode, expect in (("realistic", 0.0), ("no_queue", 3.0), ("touch", 5.0)):
+        t = make_tape(back=((4.0, 100.0),), lay=((4.2, 10.0),), trades=trades)
+        ex = Exchange(t, ExchangeConfig(commission=0.0, fill_mode=mode))
+        ex.submit(0, BACK, price_to_tick(4.2), 5.0)
+        ex.advance(); ex.advance()
+        assert sum(f.stake for f in ex.fills) == pytest.approx(expect), mode
+
+
+def test_optimistic_modes_see_same_interval_trades():
+    # trade lands in the interval in which the order goes live (step 1)
+    trades = [(1, 0, 4.2, 2.0)]
+    got = {}
+    for mode in ("realistic", "no_queue"):
+        t = make_tape(back=((4.0, 100.0),), lay=((4.2, 10.0),), trades=trades)
+        ex = Exchange(t, ExchangeConfig(commission=0.0, fill_mode=mode))
+        ex.submit(0, BACK, price_to_tick(4.2), 5.0)
+        ex.advance()
+        got[mode] = sum(f.stake for f in ex.fills)
+    assert got["realistic"] == 0.0 and got["no_queue"] == pytest.approx(2.0)

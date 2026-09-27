@@ -55,6 +55,15 @@ class ExchangeConfig:
     # Hedges below min stake are placeable live via the standard workaround
     # (place min stake at an unmatchable price, cancel down, replace price).
     allow_sub_min_hedge: bool = True
+    # Passive-fill model, for diagnosing how much results depend on execution:
+    #   "realistic": queue behind the size already shown at our price; fills
+    #                limited by traded volume (default, used for all real results)
+    #   "no_queue":  as realistic but we are always first in the queue
+    #   "touch":     first in queue AND the whole order fills on any trade at or
+    #                through our price (the edge test's generous assumption)
+    # In the two optimistic modes a new order can also be filled by trades in the
+    # same half-second it goes live, and cancels are applied before fills.
+    fill_mode: str = "realistic"
 
 
 @dataclass
@@ -274,6 +283,9 @@ class Exchange:
         # our BACK rests among other backers' offers (atl), our LAY among layers' (atb)
         book = LAY if o.side == BACK else BACK
         ticks, sizes = self._levels(self.step, o.runner, book)
+        if self.cfg.fill_mode != "realistic":
+            o.queue_ahead = 0.0
+            return
         hit = np.nonzero(ticks == o.tick)[0]
         if len(hit):
             o.queue_ahead = float(sizes[hit[0]])
@@ -296,6 +308,8 @@ class Exchange:
                 burn = min(o.queue_ahead, at)
                 o.queue_ahead -= burn
                 x = min(o.size, through + at - burn)
+                if self.cfg.fill_mode == "touch" and through + at > 0:
+                    x = o.size  # any trade at/through our price fills us completely
                 if x > 1e-9:
                     self._add_bet(o.runner, o.side, float(PRICES[o.tick]), x, passive=True)
                     o.size -= x
@@ -349,15 +363,29 @@ class Exchange:
         self._apply_removals()
         if self.tape.suspended[self.step]:
             return
-        self._passive_fills()
+        if self.cfg.fill_mode == "realistic":
+            # conservative ordering: resting orders can fill before our cancel lands,
+            # and new orders only see trades from the next interval on
+            self._passive_fills()
+            self._apply_cancels()
+            self._activate_new()
+        else:
+            self._apply_cancels()
+            self._activate_new()
+            self._passive_fills()
+        self.orders = [o for o in self.orders if o.size > 1e-9]
+
+    def _apply_cancels(self) -> None:
         if self._pending_cancels or self._pending_cancel_ids:
             for o in self.orders:
                 if o.oid <= self._pending_cancels.get(o.runner, 0) or o.oid in self._pending_cancel_ids:
                     o.size = 0.0
             self._pending_cancels.clear()
             self._pending_cancel_ids.clear()
+
+    def _activate_new(self) -> None:
         for o in self.orders:
-            if not o.live and self.step - o.placed_step >= self.cfg.latency_steps:
+            if not o.live and o.size > 1e-9 and self.step - o.placed_step >= self.cfg.latency_steps:
                 o.live = True
                 if not self.tape.active[self.step, o.runner]:
                     o.size = 0.0
@@ -365,7 +393,6 @@ class Exchange:
                 self._match_aggressive(o, o.tick, at_own_price=False)
                 if o.size > 1e-9:
                     self._init_queue(o)
-        self.orders = [o for o in self.orders if o.size > 1e-9]
 
     # ================================================================ valuation
     def hedge_plan(self, runner: int, step: int | None = None):

@@ -35,6 +35,7 @@ import numpy as np
 import pandas as pd
 
 from .edge import build_dataset, feature_record, tradeable
+from .exchange import ExchangeConfig
 from .env import CANCEL_ENTRY, CLOSE, JOIN, BACK, LAY, BetfairPreRaceEnv, EnvConfig, encode_open, list_tapes, split_by_date
 from .features import R_MAX, global_features, runner_features
 
@@ -156,8 +157,8 @@ def _init_worker(bundle_path):
 
 
 def _run_one(args):
-    tape, H, q, stake_idx, tp_idx = args
-    env = BetfairPreRaceEnv([tape], EnvConfig(), cache_tapes=False)
+    tape, H, q, stake_idx, tp_idx, fill_mode = args
+    env = BetfairPreRaceEnv([tape], EnvConfig(exchange=ExchangeConfig(fill_mode=fill_mode)), cache_tapes=False)
     pol = SignalPolicy(_W["bundle"], H, q, stake_idx, tp_idx)
     obs, _ = env.reset(options={"tape": tape})
     done, info = False, {}
@@ -168,8 +169,46 @@ def _run_one(args):
             "n_fills": info["n_fills"], "n_stops": info["n_stops"], "signals": pol.n_signals}
 
 
-def run_config(pool, tapes, H, q, stake_idx, tp_idx) -> pd.DataFrame:
-    return pd.DataFrame(list(pool.map(_run_one, [(t, H, q, stake_idx, tp_idx) for t in tapes], chunksize=2)))
+def run_config(pool, tapes, H, q, stake_idx, tp_idx, fill_mode="realistic") -> pd.DataFrame:
+    return pd.DataFrame(list(pool.map(_run_one, [(t, H, q, stake_idx, tp_idx, fill_mode) for t in tapes],
+                                      chunksize=2)))
+
+
+def make_pool(workers, bpath):
+    # "spawn", not fork: the parent may already have run OpenMP (GBM training) and
+    # forking after that deadlocks the workers' OpenMP runtime
+    import multiprocessing as mp
+    os.environ["OMP_NUM_THREADS"] = "1"  # inherited by the spawned workers
+    return ProcessPoolExecutor(workers, mp_context=mp.get_context("spawn"), initializer=_init_worker,
+                               initargs=(bpath,))
+
+
+def diagnose(a, split, horizons, qs):
+    """Same signal, same races, different fill assumptions: how much of the
+    edge-test profit is execution?"""
+    modes = a.fill_modes.split(",")
+    races = split[a.split]
+    rows = []
+    with make_pool(a.workers, a.models) as pool:
+        for H in horizons:
+            for q in qs:
+                for mode in modes:
+                    t1 = time.time()
+                    s = summarise_races(run_config(pool, races, H, q, a.stake_idx, a.tp_idx, mode))
+                    rows.append(dict(split=a.split, horizon_s=H, top_pct=q, fill_mode=mode, **s))
+                    print(f"[diagnose] H={H}s top{q}% {mode:>9}: ${s['usd_per_race']:+.3f}/race "
+                          f"(t={s['tstat_races']:+.2f}), {s['trades_per_race']:.1f} trades/race, "
+                          f"{s['pct_green']:.0f}% green  [{time.time() - t1:.0f}s]", flush=True)
+    df = pd.DataFrame(rows)
+    df.to_csv(os.path.join(a.out, f"diagnose_{a.split}.csv"), index=False)
+    pd.set_option("display.width", 220)
+    print("\n=== $/race by fill mode (t-stat across races in brackets) ===")
+    df["cell"] = df.apply(lambda r: f"{r['usd_per_race']:+.3f} ({r['tstat_races']:+.1f})", axis=1)
+    print(df.pivot_table(index=["horizon_s", "top_pct"], columns="fill_mode", values="cell", aggfunc="first")
+          [modes].to_string())
+    print("\nIf 'touch' is clearly positive while 'realistic' is negative, the edge test's profit was purely\n"
+          "an execution artefact (queue position / fills). If 'touch' is also negative, look for a\n"
+          "mechanical difference between the bot and the edge test instead.")
 
 
 def summarise_races(df: pd.DataFrame) -> dict:
@@ -196,6 +235,11 @@ def main(argv=None):
     ap.add_argument("--test-top", type=int, default=3, help="also score the next-best val configs on test")
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 1)
     ap.add_argument("--max-train", type=int, default=400_000)
+    ap.add_argument("--diagnose", action="store_true",
+                    help="no selection: score every (horizon, top%%) under each --fill-modes on --split")
+    ap.add_argument("--models", default=None, help="reuse a trained models_*.pkl (skips dataset + training)")
+    ap.add_argument("--fill-modes", default="realistic,no_queue,touch")
+    ap.add_argument("--split", default="test", choices=["val", "test"])
     a = ap.parse_args(argv)
     os.makedirs(a.out, exist_ok=True)
     horizons = [int(x) for x in a.horizons.split(",")]
@@ -204,6 +248,12 @@ def main(argv=None):
     tr, va, te = split_by_date(paths)
     split = {"train": tr, "val": va, "test": te}
     print(f"[signal_bot] races train {len(tr)} val {len(va)} test {len(te)}", flush=True)
+
+    if a.diagnose:
+        if not a.models:
+            raise SystemExit("--diagnose needs --models (a models_*.pkl from a previous run)")
+        diagnose(a, split, horizons, qs)
+        return
 
     t0 = time.time()
     cache = a.samples or os.path.join(a.out, f"samples_{a.features}.parquet")
@@ -219,12 +269,7 @@ def main(argv=None):
 
     pd.set_option("display.width", 220)
     rows = []
-    # "spawn", not fork: the parent has already run OpenMP (GBM training) and
-    # forking after that deadlocks the workers' OpenMP runtime
-    import multiprocessing as mp
-    os.environ["OMP_NUM_THREADS"] = "1"  # inherited by the spawned workers
-    with ProcessPoolExecutor(a.workers, mp_context=mp.get_context("spawn"), initializer=_init_worker,
-                             initargs=(bpath,)) as pool:
+    with make_pool(a.workers, bpath) as pool:
         for H in horizons:
             for q in qs:
                 t1 = time.time()
