@@ -50,15 +50,20 @@ from .ladder import PRICES
 from .tape import Tape
 
 TRADES = ("back_take", "lay_take", "back_passive", "lay_passive")
-TARGETS = TRADES + ("mid",)
+TARGETS = TRADES + ("mid", "mid_ticks")
 # features that describe *our* position/orders/brackets are always zero here
 POSITION_FEATURES = list(range(22, 31)) + list(range(34, 38))
 
 
 def build_samples(path: str, horizons_s=(10, 30, 60), every_s: float = 2.0, exit_cutoff_s: float = 0.0,
-                  min_size: float = 5.0, max_spread_ticks: int = 3, max_price: float = 30.0) -> pd.DataFrame | None:
+                  min_size: float = 5.0, max_spread_ticks: int = 3, max_price: float = 30.0,
+                  extended: bool = False) -> pd.DataFrame | None:
     t = Tape.load(path)
     h = TapeHistory(t)
+    micro = None
+    if extended:
+        from .microfeatures import compute as micro_compute
+        micro = micro_compute(t, h.mid)
     ex = Exchange(t, ExchangeConfig())
     ex.brackets = {}
     comm = t.base_rate / 100.0
@@ -112,9 +117,10 @@ def build_samples(path: str, horizons_s=(10, 30, 60), every_s: float = 2.0, exit
                     "back_passive": (pl / pl2 - 1) if back_fill else 0.0,
                     "lay_passive": (1 - pb / pb2) if lay_fill else 0.0,
                     "mid": (pb + pl) / (pb2 + pl2) - 1,
+                    "mid_ticks": float(h.mid[e, r] - h.mid[s, r]),  # < 0 = price shortened
                 }
                 for name, v in vals.items():
-                    if name != "mid" and np.isfinite(v) and v > 0:
+                    if not name.startswith("mid") and np.isfinite(v) and v > 0:
                         v *= 1 - comm
                     rec[f"{name}_{H}"] = v
                 any_target = True
@@ -123,6 +129,9 @@ def build_samples(path: str, horizons_s=(10, 30, 60), every_s: float = 2.0, exit
             for i in range(N_RUNNER_FEATURES):
                 if i not in POSITION_FEATURES:
                     rec[f"r{i}"] = F[r, i]
+            if micro is not None:
+                for name_, arr in micro.items():
+                    rec[f"x_{name_}"] = arr[s, r]
             for i in range(N_GLOBAL_FEATURES):
                 if i not in (6, 7, 8, 11):  # funds / P&L / fills: always constant here
                     rec[f"g{i}"] = g[i]
@@ -165,7 +174,8 @@ def _per_race(df_sel: pd.DataFrame, col: str, races: list[str], stake: float):
 
 
 def fit_and_score(df: pd.DataFrame, split: dict, horizons, stake: float = 10.0, max_train: int = 400_000,
-                  seed: int = 0) -> tuple[pd.DataFrame, pd.DataFrame]:
+                  seed: int = 0, feature_set: str = "base", targets=TARGETS,
+                  models_to_fit=("ridge", "gbm")) -> tuple[pd.DataFrame, pd.DataFrame]:
     from scipy.stats import spearmanr
     from sklearn.ensemble import HistGradientBoostingRegressor
     from sklearn.linear_model import Ridge
@@ -173,6 +183,10 @@ def fit_and_score(df: pd.DataFrame, split: dict, horizons, stake: float = 10.0, 
     from sklearn.preprocessing import StandardScaler
 
     feat = [c for c in df.columns if c[0] in "rg" and c[1:].isdigit()]
+    if feature_set == "extended":
+        feat += [c for c in df.columns if c.startswith("x_")]
+    elif feature_set == "micro_only":
+        feat = [c for c in df.columns if c.startswith("x_")]
     day_of = {os.path.basename(p).split(".npz")[0]: k for k, ps in split.items() for p in ps}
     df = df.assign(split=df["race"].map(day_of))
     parts = {k: df[df["split"] == k] for k in ("train", "val", "test")}
@@ -181,8 +195,10 @@ def fit_and_score(df: pd.DataFrame, split: dict, horizons, stake: float = 10.0, 
     rng = np.random.default_rng(seed)
     pred_rows, rule_rows = [], []
     for H in horizons:
-        for name in TARGETS:
+        for name in targets:
             col = f"{name}_{H}"
+            if col not in df.columns:
+                continue
             tr = parts["train"].dropna(subset=[col])
             if len(tr) > max_train:
                 tr = tr.iloc[rng.choice(len(tr), max_train, replace=False)]
@@ -197,15 +213,15 @@ def fit_and_score(df: pd.DataFrame, split: dict, horizons, stake: float = 10.0, 
                                                      early_stopping=True, validation_fraction=0.1,
                                                      random_state=seed),
             }
-            for mname, m in models.items():
+            for mname, m in ((k, v) for k, v in models.items() if k in models_to_fit):
                 m.fit(tr[feat].values, y.values)
                 pv, pt = m.predict(va[feat].values), m.predict(te[feat].values)
                 ic = spearmanr(pt, te[col].values).statistic
                 r2 = 1 - np.mean((te[col].values - pt) ** 2) / np.var(te[col].values)
                 pred_rows.append(dict(horizon_s=H, target=name, model=mname, test_ic=ic, test_r2=r2,
                                       n_train=len(tr), n_test=len(te),
-                                      mean_return_all=float(te[col].mean())))
-                if name == "mid":
+                                      mean_return_all=float(te[col].mean()), features=feature_set))
+                if name.startswith("mid"):
                     continue
                 # trading rule: act only on the top-q% predictions; q (-> theta) chosen on validation
                 best = None
@@ -224,8 +240,8 @@ def fit_and_score(df: pd.DataFrame, split: dict, horizons, stake: float = 10.0, 
                 sel = te[pt > th]
                 race_mean, tstat, _ = _per_race(sel, col, test_races, stake)
                 rule_rows.append(dict(
-                    horizon_s=H, trade=name, model=mname, top_pct=q, val_mean_return=val_mean,
-                    val_usd_per_race=val_usd,
+                    horizon_s=H, trade=name, model=mname, features=feature_set, top_pct=q,
+                    val_mean_return=val_mean, val_usd_per_race=val_usd,
                     test_trades=len(sel), test_trades_per_race=len(sel) / max(len(test_races), 1),
                     test_mean_return=float(sel[col].mean()) if len(sel) else np.nan,
                     test_hit_rate=float((sel[col] > 0).mean()) if len(sel) else np.nan,
@@ -255,6 +271,7 @@ def main(argv=None):
     ap.add_argument("--stake", type=float, default=10.0)
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 1)
     ap.add_argument("--max-train", type=int, default=400_000)
+    ap.add_argument("--features", default="base", choices=["base", "extended"])
     a = ap.parse_args(argv)
     os.makedirs(a.out, exist_ok=True)
     horizons = [int(x) for x in a.horizons.split(",")]
@@ -263,15 +280,16 @@ def main(argv=None):
     split = {"train": tr, "val": va, "test": te}
     print(f"[edge] races train {len(tr)} val {len(va)} test {len(te)}", flush=True)
     t0 = time.time()
-    df = build_dataset(paths, cache=os.path.join(a.out, "samples.parquet"), workers=a.workers,
-                       horizons_s=horizons, every_s=a.every_s, exit_cutoff_s=a.exit_cutoff_s)
+    df = build_dataset(paths, cache=os.path.join(a.out, f"samples_{a.features}.parquet"), workers=a.workers,
+                       horizons_s=horizons, every_s=a.every_s, exit_cutoff_s=a.exit_cutoff_s,
+                       extended=a.features == "extended")
     print(f"[edge] {len(df):,} samples from {df['race'].nunique()} races in {time.time() - t0:.0f}s", flush=True)
 
     pd.set_option("display.width", 200)
     costs = cost_table(df, horizons)
     print("\n=== Cost of trading blindly (mean return per $1 staked, net of commission) ===")
     print(costs.round(4).to_string(index=False))
-    preds, rules = fit_and_score(df, split, horizons, a.stake, a.max_train)
+    preds, rules = fit_and_score(df, split, horizons, a.stake, a.max_train, feature_set=a.features)
     print("\n=== Predictability on TEST days (Spearman IC between prediction and outcome) ===")
     print(preds.round(4).to_string(index=False))
     print(f"\n=== Trading rules (threshold chosen on VAL, scored on TEST, ${a.stake:g} stake per trade) ===")
