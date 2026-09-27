@@ -99,8 +99,9 @@ class RunnerTransformerPolicy(nn.Module):
 
     @staticmethod
     def runner_entropy(dists):
-        p_open = dists[0].probs[..., TYPE_OPEN]
-        return dists[0].entropy() + p_open * sum(d.entropy() for d in dists[1:])
+        # sub-head entropies are NOT weighted by p(open): that weighting would
+        # reward opening trades just to collect entropy bonus
+        return dists[0].entropy() + 0.25 * sum(d.entropy() for d in dists[1:])
 
     @torch.no_grad()
     def act(self, obs: dict, deterministic: bool = False, device="cpu"):
