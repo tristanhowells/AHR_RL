@@ -46,8 +46,8 @@ import gymnasium as gym
 import numpy as np
 
 from .exchange import BACK, LAY, Exchange, ExchangeConfig
-from .features import (N_GLOBAL_FEATURES, N_RUNNER_FEATURES, R_MAX, TapeHistory,
-                       global_features, runner_features)
+from .features import (N_GLOBAL_FEATURES, N_RUNNER_FEATURES, R_MAX, TapeHistory, global_features,
+                       n_runner_features_v2, runner_features, runner_features_v2)
 from .ladder import N_TICKS, PRICES, price_to_tick
 from .tape import Tape
 
@@ -71,6 +71,25 @@ class EnvConfig:
     auto_green_s: float | None = 0.0
     close_slippage_ticks: int = 2
     exchange: ExchangeConfig = field(default_factory=ExchangeConfig)
+    # ---- v2 (see EnvConfig.v2 and docs/V2.md)
+    features: str = "v1"  # "v1" | "v2"
+    n_static: int = 0  # catalogue features per runner (v2)
+    forecaster_path: str | None = None  # forecaster.pkl -> predictions become features (v2)
+    hold_sl_ticks: int = 12  # stop distance for tp == 0 ("hold until the auto-green")
+
+    @classmethod
+    def v2(cls, **kw) -> "EnvConfig":
+        """Preset built from what the data showed: short-horizon order-book
+        scalping has no executable edge, so decisions are slower (10s), trades
+        can be held for minutes or to the scheduled start (tp=0), and the agent
+        sees engineered order-book, longer price-history, form and forecaster
+        features."""
+        from .catalogue import N_STATIC
+
+        base = dict(features="v2", n_static=N_STATIC, decision_every=20, tp_ticks=(3, 8, 0), sl_mult=1.5,
+                    max_hold_s=600.0, random_start_s=30.0)
+        base.update(kw)
+        return cls(**base)
 
     @property
     def n_actions(self) -> int:
@@ -131,8 +150,17 @@ class BetfairPreRaceEnv(gym.Env):
         self._next = 0
         self.rng = random.Random(seed)
         self.action_space = gym.spaces.MultiDiscrete([self.cfg.n_actions] * R_MAX)
+        self.forecaster = None
+        n_feat = N_RUNNER_FEATURES
+        if self.cfg.features == "v2":
+            if self.cfg.forecaster_path:
+                from .forecaster import Forecaster
+
+                self.forecaster = Forecaster.load(self.cfg.forecaster_path)
+            n_feat = n_runner_features_v2(self.cfg.n_static,
+                                          self.forecaster.n_outputs if self.forecaster else 0)
         self.observation_space = gym.spaces.Dict({
-            "runners": gym.spaces.Box(-10, 10, (R_MAX, N_RUNNER_FEATURES), np.float32),
+            "runners": gym.spaces.Box(-10, 10, (R_MAX, n_feat), np.float32),
             "global": gym.spaces.Box(-10, 10, (N_GLOBAL_FEATURES,), np.float32),
             "mask": gym.spaces.MultiBinary(R_MAX),
         })
@@ -149,7 +177,11 @@ class BetfairPreRaceEnv(gym.Env):
         return t
 
     def _obs(self):
-        R, mask = runner_features(self.hist, self.ex.step, self.ex)
+        if self.cfg.features == "v2":
+            R, mask = runner_features_v2(self.hist, self.ex.step, self.ex, self.cfg.n_static, self.forecaster,
+                                         race_day=self.tape.name[:8])
+        else:
+            R, mask = runner_features(self.hist, self.ex.step, self.ex)
         g = global_features(self.hist, self.ex.step, self.ex, self._phi)
         return {"runners": R, "global": g, "mask": mask.astype(np.int8)}
 
@@ -291,7 +323,8 @@ class BetfairPreRaceEnv(gym.Env):
         if o is None:
             return
         self.n_opens += 1
-        ex.brackets[r] = Bracket(side, tp, max(1, int(round(self.cfg.sl_mult * tp))), ex.step, entry_oid=o.oid)
+        sl = self.cfg.hold_sl_ticks if tp == 0 else max(1, int(round(self.cfg.sl_mult * tp)))
+        ex.brackets[r] = Bracket(side, tp, sl, ex.step, entry_oid=o.oid)
 
     def _close(self, r):
         ex = self.ex
@@ -349,6 +382,8 @@ class BetfairPreRaceEnv(gym.Env):
                     b.closing = True
                     ex.cancel_runner(r)
                     continue
+                if b.tp == 0:
+                    continue  # "hold": no take-profit, exit via stop / CLOSE / auto-green
                 # keep one exit order resting at the target, sized to green the runner
                 tgt = e_tk - b.tp if b.side == BACK else e_tk + b.tp
                 tgt = int(np.clip(tgt, 0, N_TICKS - 1))

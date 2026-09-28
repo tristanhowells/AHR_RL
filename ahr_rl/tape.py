@@ -54,6 +54,9 @@ class Tape:
     went_in_play: bool  # False => abandoned/closed before the off: all bets void
     winner: int  # runner index of the winner, -1 unknown
     bsp: np.ndarray  # [R] float32, 0 unknown
+    # optional per-runner static (pre-race form / race) features from the
+    # market catalogue, see catalogue.py. None for tapes built without one.
+    static: np.ndarray | None = None  # [R, S] float32
 
     @property
     def n_steps(self) -> int:
@@ -73,7 +76,7 @@ class Tape:
         return self.trade_runner[a:b], self.trade_tick[a:b], self.trade_vol[a:b]
 
     def save(self, path: str) -> None:
-        d = {k: v for k, v in self.__dict__.items() if not k.startswith("_")}
+        d = {k: v for k, v in self.__dict__.items() if not k.startswith("_") and v is not None}
         np.savez_compressed(path, **d)
 
     @staticmethod
@@ -289,6 +292,12 @@ if __name__ == "__main__":
     ap.add_argument("--dt", type=float, default=0.5)
     ap.add_argument("--levels", type=int, default=8)
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 1)
+    ap.add_argument("--catalogues", default=None, help="attach static form features from this catalogue dir")
     a = ap.parse_args()
     out = build_all(a.src, a.out, a.dt, a.levels, a.workers)
     print(f"{len(out)} tapes in {a.out}")
+    if a.catalogues:
+        from .catalogue import attach
+
+        d, m = attach(a.out, a.catalogues)
+        print(f"catalogue features attached to {d} tapes ({m} without a catalogue)")

@@ -53,7 +53,11 @@ def train(args):
     print(f"tapes: train {len(tr)}  val {len(va)}  test {len(te)}")
     json.dump({"train": tr, "val": va, "test": te}, open(os.path.join(args.out, "split.json"), "w"), indent=1)
 
-    cfg = EnvConfig(random_start_s=args.random_start_s)
+    if args.env == "v2":
+        cfg = EnvConfig.v2(forecaster_path=args.forecaster, random_start_s=args.random_start_s)
+    else:
+        cfg = EnvConfig(random_start_s=args.random_start_s)
+    args.n_runner_features = int(BetfairPreRaceEnv([], cfg).observation_space["runners"].shape[1])
     json.dump({**vars(args), "env": asdict(cfg)}, open(os.path.join(args.out, "config.json"), "w"), indent=1, default=str)
     fns = [make_env_fn(tr, cfg, args.seed + i) for i in range(args.n_envs)]
     if args.n_envs > 1 and not args.sync:
@@ -62,8 +66,8 @@ def train(args):
         venv = gym.vector.SyncVectorEnv(fns, autoreset_mode=gym.vector.AutoresetMode.SAME_STEP)
 
     device = torch.device(args.device)
-    model = RunnerTransformerPolicy(cfg, d_model=args.d_model, n_layers=args.n_layers,
-                                    noop_bias=args.noop_bias).to(device)
+    model = RunnerTransformerPolicy(cfg, d_model=args.d_model, n_layers=args.n_layers, noop_bias=args.noop_bias,
+                                    n_runner_features=args.n_runner_features).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr, eps=1e-5)
 
     N, T = args.n_envs, args.n_steps
@@ -99,6 +103,9 @@ def train(args):
         frac = 1.0 - (update - 1) / n_updates
         for pg in opt.param_groups:
             pg["lr"] = args.lr * max(frac, 0.1)
+        # exploration floor, annealed linearly to 0 over the first explore_anneal_frac of training
+        prog = (update - 1) / n_updates
+        model.explore_eps = args.explore_floor * max(0.0, 1.0 - prog / max(args.explore_anneal_frac, 1e-9))
         model.eval()
         for t in range(T):
             o_r, o_g, o_m = to_t(obs)
@@ -170,7 +177,8 @@ def train(args):
                 v_clip = ov + torch.clamp(v - ov, -args.clip_v, args.clip_v)
                 vl = 0.5 * (torch.max((v - rt) ** 2, (v_clip - rt) ** 2) * m).sum() / m.sum().clamp(min=1)
                 ent = (model.runner_entropy(dist) * m).sum() / m.sum().clamp(min=1)
-                loss = pg + args.vf_coef * vl - args.ent_coef * ent
+                tent = (model.type_entropy(dist) * m).sum() / m.sum().clamp(min=1)
+                loss = pg + args.vf_coef * vl - args.ent_coef * ent - args.type_ent_coef * tent
                 opt.zero_grad()
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
@@ -187,7 +195,9 @@ def train(args):
         val_s = {"mean_green_$": np.nan, "pct_green": np.nan, "mean_turnover_$": np.nan, "mean_trades": np.nan}
         if update % args.eval_every == 0 or update == n_updates:
             model.eval()
+            eps, model.explore_eps = model.explore_eps, 0.0  # evaluate the policy itself
             df = evaluate(make_torch_policy(model, True, device), va[: args.eval_races], cfg)
+            model.explore_eps = eps
             val_s = summarise(df)
             ck = {"model": model.state_dict(), "cfg": asdict(cfg), "args": vars(args), "update": update,
                   "val": val_s}
@@ -202,7 +212,8 @@ def train(args):
                    f"{val_s['mean_turnover_$']:.1f},{val_s['mean_trades']:.2f}\n")
         logf.flush()
         print(f"upd {update}/{n_updates} steps {global_step} sps {sps:.0f} | train green(50ep) {eg:+.2f} "
-              f"turnover {et:.0f} | p_open {p_open:.4f} ent {ent_v:.3f} kl {kl_v:.4f} vloss {v_l:.3f}"
+              f"turnover {et:.0f} | p_open {p_open:.4f} eps {model.explore_eps:.3f} ent {ent_v:.3f} kl {kl_v:.4f} "
+              f"vloss {v_l:.3f}"
               + (f" | VAL green {val_s['mean_green_$']:+.2f} ({val_s['pct_green']:.0f}% green, "
                  f"{val_s['mean_trades']:.1f} trades)" if not np.isnan(val_s['mean_green_$']) else ""),
               flush=True)
@@ -235,8 +246,15 @@ def parse_args(argv=None):
     ap.add_argument("--random-start-s", type=float, default=30.0)
     ap.add_argument("--val-frac", type=float, default=0.15)
     ap.add_argument("--test-frac", type=float, default=0.15)
-    ap.add_argument("--eval-every", type=int, default=10)
-    ap.add_argument("--eval-races", type=int, default=200)
+    ap.add_argument("--eval-every", type=int, default=25)
+    ap.add_argument("--eval-races", type=int, default=50)
+    ap.add_argument("--env", default="v1", choices=["v1", "v2"])
+    ap.add_argument("--forecaster", default=None, help="forecaster.pkl for --env v2")
+    ap.add_argument("--explore-floor", type=float, default=0.0,
+                    help="min P(OPEN) per runner-decision at the start of training (mixture; annealed)")
+    ap.add_argument("--explore-anneal-frac", type=float, default=0.5)
+    ap.add_argument("--type-ent-coef", type=float, default=0.0,
+                    help="extra entropy bonus on the noop/close/cancel/open decision")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--sync", action="store_true", help="single-process envs (debugging)")
     ap.add_argument("--seed", type=int, default=0)

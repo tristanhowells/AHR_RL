@@ -137,3 +137,54 @@ def global_features(h: TapeHistory, step: int, ex, green_value: float) -> np.nda
     g[10] = ex.commission
     g[11] = np.log1p(len(ex.fills)) / 4
     return np.clip(g, -5, 5)
+
+
+# =============================================================================== v2
+# v1 features + engineered microstructure + longer price history + catalogue
+# form/race features (+ optional forecaster outputs). See docs/V2.md.
+MICRO_V2 = ("wom1", "wom3_chg10", "wom3_chg30", "flow_10", "flow_30", "wap_sess", "ltp_wap_30", "lvol_120")
+_MICRO_SCALE = {"wap_sess": 5.0, "ltp_wap_30": 5.0, "lvol_120": 6.0}
+_LONG_LAGS_S = (120, 300)
+
+
+def n_runner_features_v2(n_static: int, n_forecast: int = 0) -> int:
+    return N_RUNNER_FEATURES + len(MICRO_V2) + len(_LONG_LAGS_S) + 1 + n_static + n_forecast
+
+
+def _micro(h: TapeHistory) -> dict:
+    m = getattr(h, "_micro", None)
+    if m is None:
+        from .microfeatures import compute
+
+        m = h._micro = compute(h.tape, h.mid)
+    return m
+
+
+def runner_features_v2(h: TapeHistory, step: int, ex, n_static: int, forecaster=None,
+                       race_day: str | None = None) -> tuple[np.ndarray, np.ndarray]:
+    F1, mask = runner_features(h, step, ex)
+    t = h.tape
+    R = min(t.n_runners, R_MAX)
+    blocks = [F1]
+    micro = _micro(h)
+    M = np.zeros((R_MAX, len(MICRO_V2)), np.float32)
+    for j, name in enumerate(MICRO_V2):
+        M[:R, j] = micro[name][step, :R] / _MICRO_SCALE.get(name, 1.0)
+    blocks.append(np.clip(M, -5, 5))
+    L = np.zeros((R_MAX, len(_LONG_LAGS_S) + 1), np.float32)
+    mid = h.mid[step, :R]
+    for j, lag in enumerate(_LONG_LAGS_S):
+        m0 = h.mid[max(0, step - int(lag / h.dt)), :R]
+        L[:R, j] = np.where((m0 >= 0) & (mid >= 0), np.clip(mid - m0, -40, 40) / 10, 0)
+    m0 = h.mid[0, :R]
+    L[:R, -1] = np.where((m0 >= 0) & (mid >= 0), np.clip(mid - m0, -60, 60) / 10, 0)
+    blocks.append(L)
+    S = np.zeros((R_MAX, n_static), np.float32)
+    if n_static and getattr(t, "static", None) is not None:
+        S[:R] = t.static[:R, :n_static]
+    blocks.append(S)
+    if forecaster is not None:
+        blocks.append(forecaster.predict(h, step, ex, race_day, mask))
+    F = np.concatenate(blocks, axis=1)
+    F[~mask] = 0
+    return F, mask

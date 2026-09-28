@@ -1,0 +1,13 @@
+{"market_id": "1.261564778", "catalogue": {"marketId": "1.261564778", "marketName": "R7 1200m Grp3",
+ "description": {"marketBaseRate": 8.0, "raceType": "Flat", "marketType": "WIN"},
+ "runners": [
+  {"selectionId": 6913761, "runnerName": "1. Seize the Day", "sortPriority": 1,
+   "metadata": {"FORM": "311x", "STALL_DRAW": "3", "DAYS_SINCE_LAST_RUN": "154", "AGE": "3", "SEX_TYPE": "c", "WEIGHT_VALUE": "59.5", "JOCKEY_CLAIM": null}},
+  {"selectionId": 102098421, "runnerName": "2. Unit Five", "sortPriority": 2,
+   "metadata": {"FORM": "110x", "STALL_DRAW": "6", "DAYS_SINCE_LAST_RUN": "189", "AGE": "3", "SEX_TYPE": "c", "WEIGHT_VALUE": "58", "JOCKEY_CLAIM": null}},
+  {"selectionId": 102098422, "runnerName": "3. Rich On Bubbles", "sortPriority": 3,
+   "metadata": {"FORM": "110x5", "STALL_DRAW": "10", "DAYS_SINCE_LAST_RUN": "21", "AGE": "3", "SEX_TYPE": "g", "WEIGHT_VALUE": "58", "JOCKEY_CLAIM": null}},
+  {"selectionId": 102098426, "runnerName": "10. Aethera", "sortPriority": 9,
+   "metadata": {"FORM": "1x", "STALL_DRAW": "5", "DAYS_SINCE_LAST_RUN": "84", "AGE": "3", "SEX_TYPE": "f", "WEIGHT_VALUE": "55", "JOCKEY_CLAIM": "2"}}
+ ],
+ "event": {"venue": "Caulfield", "countryCode": "AU"}}}

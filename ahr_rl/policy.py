@@ -40,10 +40,14 @@ class ActionCodec:
 
 class RunnerTransformerPolicy(nn.Module):
     def __init__(self, cfg: EnvConfig, d_model: int = 96, n_layers: int = 2, n_heads: int = 4,
-                 noop_bias: float = 3.0, close_bias: float = -3.0):
+                 noop_bias: float = 3.0, close_bias: float = -3.0, n_runner_features: int | None = None):
         super().__init__()
         self.codec = ActionCodec(cfg)
-        self.runner_in = nn.Sequential(nn.Linear(N_RUNNER_FEATURES + N_GLOBAL_FEATURES, d_model), nn.GELU(),
+        self.n_runner_features = n_runner_features or N_RUNNER_FEATURES
+        # exploration floor: probability mass mixed into OPEN on the type head
+        # (a mixture, so PPO stays exactly on-policy). Set by the trainer; 0 at eval.
+        self.explore_eps = 0.0
+        self.runner_in = nn.Sequential(nn.Linear(self.n_runner_features + N_GLOBAL_FEATURES, d_model), nn.GELU(),
                                        nn.Linear(d_model, d_model))
         self.market_in = nn.Sequential(nn.Linear(N_GLOBAL_FEATURES, d_model), nn.GELU(), nn.Linear(d_model, d_model))
         layer = nn.TransformerEncoderLayer(d_model, n_heads, 2 * d_model, dropout=0.0, batch_first=True,
@@ -82,7 +86,12 @@ class RunnerTransformerPolicy(nn.Module):
 
     def dist(self, runners, glob, mask):
         logits, value = self.forward(runners, glob, mask)
-        return [Categorical(logits=l) for l in logits], value
+        dists = [Categorical(logits=l) for l in logits]
+        if self.explore_eps > 0:
+            floor = torch.zeros_like(dists[0].probs)
+            floor[..., TYPE_OPEN] = 1.0
+            dists[0] = Categorical(probs=(1 - self.explore_eps) * dists[0].probs + self.explore_eps * floor)
+        return dists, value
 
     @staticmethod
     def sample(dists, deterministic=False):
@@ -102,6 +111,10 @@ class RunnerTransformerPolicy(nn.Module):
         # sub-head entropies are NOT weighted by p(open): that weighting would
         # reward opening trades just to collect entropy bonus
         return dists[0].entropy() + 0.25 * sum(d.entropy() for d in dists[1:])
+
+    @staticmethod
+    def type_entropy(dists):
+        return dists[0].entropy()
 
     @torch.no_grad()
     def act(self, obs: dict, deterministic: bool = False, device="cpu"):

@@ -42,7 +42,8 @@ def load_model(path: str, device="cpu"):
     cfg = EnvConfig(**{k: (tuple(v) if isinstance(v, list) else v) for k, v in c.items() if k != "exchange"})
     cfg.exchange = ExchangeConfig(**c["exchange"])
     a = ck.get("args", {})
-    model = RunnerTransformerPolicy(cfg, d_model=a.get("d_model", 96), n_layers=a.get("n_layers", 2))
+    model = RunnerTransformerPolicy(cfg, d_model=a.get("d_model", 96), n_layers=a.get("n_layers", 2),
+                                    n_runner_features=a.get("n_runner_features"))
     model.load_state_dict(ck["model"])
     model.eval()
     return model, cfg
