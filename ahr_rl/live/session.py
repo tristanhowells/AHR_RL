@@ -20,7 +20,8 @@ from ..tape import TapeBuilder
 
 class MarketSession:
     def __init__(self, market_id: str, market_start_ms: float, policy_fn: Callable, env_cfg: EnvConfig,
-                 exchange_factory: Callable[..., Exchange] | None = None, log: Callable = print):
+                 exchange_factory: Callable[..., Exchange] | None = None, log: Callable = print,
+                 catalogue: dict | None = None, static=None):
         self.cfg = env_cfg
         self.builder = TapeBuilder(market_id, market_start_ms, dt=0.5)
         self.policy_fn = policy_fn
@@ -32,6 +33,10 @@ class MarketSession:
         self.decisions = 0
         self.obs_trace: list = []  # (step, obs) for parity testing
         self.keep_trace = False
+        # v2: per-runner form features, from a raw listMarketCatalogue record
+        # (or a precomputed [R, S] array, used by the parity test)
+        self.catalogue = catalogue
+        self._static = static
 
     @property
     def done(self) -> bool:
@@ -55,6 +60,11 @@ class MarketSession:
         if not b.n_rows:
             return
         tape = b.tape(name=b.market_id)
+        if self._static is None and self.catalogue is not None and b.sids:
+            from ..catalogue import static_features
+
+            self._static = static_features(self.catalogue, b.sids)
+        tape.static = self._static
         if self.ex is None:
             self.ex = self.exchange_factory(tape, self.cfg.exchange)
             self.env.attach(tape, self.ex)

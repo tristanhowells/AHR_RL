@@ -61,10 +61,19 @@ def main():
     ap.add_argument("--join-before-s", type=float, default=600)
     ap.add_argument("--countries", default="AU")
     ap.add_argument("--log", default="live_results.csv")
+    ap.add_argument("--ignore-gate", action="store_true",
+                    help="allow real money with a checkpoint that has not passed the test-set gate (not advised)")
     args = ap.parse_args()
     live = args.live and args.i_understand_this_bets_real_money
     if args.live and not live:
         raise SystemExit("--live also needs --i-understand-this-bets-real-money")
+    if live and not args.ignore_gate:
+        gate_path = os.path.join(os.path.dirname(os.path.abspath(args.model)), "gate.json")
+        gate = json.load(open(gate_path)) if os.path.exists(gate_path) else {}
+        if not gate.get("passed"):
+            raise SystemExit(f"refusing real money: {gate_path} missing or not passed. Run "
+                             "`python -m ahr_rl.report --run <run dir>` first; the agent must beat "
+                             "'do nothing' on unseen test races (mean > 0, t > 2).")
 
     model, cfg = load_model(args.model)
     policy = make_torch_policy(model, deterministic=True)
@@ -108,13 +117,15 @@ def main():
                                              market_type_codes=["WIN"],
                                              market_start_time={"from": t0.isoformat(),
                                                                 "to": (t0 + timedelta(minutes=12)).isoformat()}),
-                market_projection=["MARKET_START_TIME"], max_results=50)
+                market_projection=["MARKET_START_TIME", "RUNNER_METADATA", "MARKET_DESCRIPTION"],
+                max_results=50)
             for c in cats:
                 mid = c.market_id
                 secs = (c.market_start_time.replace(tzinfo=timezone.utc) - t0).total_seconds()
                 if mid not in sessions and secs <= args.join_before_s + 15:
                     start_ms = c.market_start_time.replace(tzinfo=timezone.utc).timestamp() * 1000
-                    sessions[mid] = MarketSession(mid, start_ms, policy, cfg, exchange_factory(mid))
+                    sessions[mid] = MarketSession(mid, start_ms, policy, cfg, exchange_factory(mid),
+                                                  catalogue=getattr(c, "_data", None))
                     print(f"joined {mid} ({secs:.0f}s to start)")
             want = {m for m, s in sessions.items() if not s.done}
             if want and want != subscribed:

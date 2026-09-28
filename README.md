@@ -104,6 +104,34 @@ python -m ahr_rl.live.bot --model runs/ppo/best.pt                             #
 Or open `notebooks/AHR_RL_train_colab.ipynb` in Colab to run everything on the
 full Drive dataset.
 
+## V2 agent (current recommendation)
+
+V2 is the environment and agent rebuilt around what the tests showed: 10s
+decisions, trades held for minutes or to the start, engineered order-book,
+longer price-history and catalogue form features, a cross-fitted price-move
+forecaster whose predictions the agent sees, and a PPO exploration floor.
+Results come with a test-set report broken down by segment and a deployment
+gate.
+
+See `docs/V2.md` for the evidence behind each choice, and notebook section V2
+to run it.
+
+```bash
+python -m ahr_rl.catalogue data/tapes "<drive>/betfair stream data/catalogues"   # form features
+python -m ahr_rl.forecaster --samples runs/edge/samples_base.parquet --tapes "data/tapes/*.npz" --out runs/fc.pkl
+python -m ahr_rl.train --env v2 --forecaster runs/fc.pkl --out runs/ppo_v2 --explore-floor 0.05 --type-ent-coef 0.01
+python -m ahr_rl.report --run runs/ppo_v2            # writes gate.json
+```
+
+## Research tools
+
+| Module | Question it answers |
+|---|---|
+| `edge.py` | Do the features predict price moves well enough to beat round-trip costs? |
+| `feature_study.py` | Which engineered features add signal? |
+| `signal_bot.py` (`--diagnose`) | Does the edge survive realistic execution, and how much is fill modelling? |
+| `continuous.py`, `compare.py` | Continuous allocation spec with PPO vs SAC |
+
 ## Live trading
 
 `MarketSession` feeds raw stream messages through the *same* `TapeBuilder`,
@@ -111,7 +139,10 @@ features, policy and env decision code used in training.
 `tests/test_live_parity.py` replays recordings message by message and asserts
 bit-identical observations, fills and P&L versus the offline env.
 
-Paper mode is the default. Real money needs `--live
+Paper mode is the default. Real money also requires the checkpoint's
+`gate.json` (from `ahr_rl.report`) to show it beat "do nothing" on unseen
+test races (mean > 0, t > 2); `--ignore-gate` overrides this and is not
+advised. Real money needs `--live
 --i-understand-this-bets-real-money`. **The real-money router
 (`betfair_exchange.py`) has never been run against the live exchange.** Paper
 trade first, then use minimal stakes.
