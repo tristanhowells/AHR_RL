@@ -137,6 +137,9 @@ python -m ahr_rl.report --run runs/ppo_v2            # writes gate.json
 | `continuous.py`, `compare.py` | Continuous allocation spec with PPO vs SAC |
 | `market_study.py` | Which runners are tradeable (market share, rank, time to off), which signals (WoM, WAP, price and volume rate of change) carry information, how they cross, and can any of it be traded? |
 | `race_study.py` | Do track, state, metro, distance, race type, class, day of week and time of day change how tradeable a race is? |
+| `bsp_study.py` | Value betting: does anything (exchange prices, projected BSP, a form + market model) beat BSP on who wins? |
+| `leadlag_study.py` | Does an outside price (bookmaker/tote CSV; projected BSP until one exists) lead the exchange, and can the gap be traded? |
+| `sweep_passive.py` | After a sweep, does a resting order on the snap-back side make money in the full queue-aware simulator? |
 | `jump_study.py` | After a sudden price jump, or once a price leaves its session WAP, does it keep going or come back, and can you trade it? |
 
 ## Live trading
