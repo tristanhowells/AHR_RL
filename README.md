@@ -140,6 +140,7 @@ python -m ahr_rl.report --run runs/ppo_v2            # writes gate.json
 | `bsp_study.py` | Value betting: does anything (exchange prices, projected BSP, a form + market model) beat BSP on who wins? |
 | `leadlag_study.py` | Does an outside price (bookmaker/tote CSV; projected BSP until one exists) lead the exchange, and can the gap be traded? |
 | `sweep_passive.py` | After a sweep, does a resting order on the snap-back side make money in the full queue-aware simulator? |
+| `community.py` | The pre-off rules traders automate (WOM scalp, pressure scalp, gap fill, volume levels, spoofs, scratchings, arbitrage), tested honestly |
 | `jump_study.py` | After a sudden price jump, or once a price leaves its session WAP, does it keep going or come back, and can you trade it? |
 
 ## Live trading

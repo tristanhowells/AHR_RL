@@ -28,3 +28,18 @@ def test_leadlag_and_sweep_run(tmp_path):
     res = run_trade(t, end, e["step"], e["runner"], BACK, "join", 10, 2, 60)
     assert 0 <= res["filled"] <= 1
     assert res["filled"] == 0 or np.isfinite(res["pnl"])
+
+
+def test_community_runs(tmp_path):
+    from ahr_rl.community import _prep, arbitrage, bracket, study_tape
+
+    t = make_synthetic_tape(1)
+    p = str(tmp_path / "20260101_0000_Test_1_2.npz")
+    t.save(p)
+    res = study_tape(p)
+    assert set(res) == {"scalp", "signal", "arb"}
+    for r in res["scalp"]:
+        assert 0 <= r["filled"] <= 1 and (r["filled"] == 0 or np.isfinite(r["pnl"]))
+    P = _prep(t)
+    a = arbitrage(t, P, "x")
+    assert a["back_arb"] >= a["back_arb_persist"] >= 0
