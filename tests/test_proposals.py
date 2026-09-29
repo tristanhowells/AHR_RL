@@ -43,3 +43,19 @@ def test_community_runs(tmp_path):
     P = _prep(t)
     a = arbitrage(t, P, "x")
     assert a["back_arb"] >= a["back_arb_persist"] >= 0
+
+
+def test_sweep_bsp_trade(tmp_path):
+    from ahr_rl.sweep_bsp import _score, study_tape
+
+    # green position: same P&L either way; commission only on profit
+    sc = _score(1.0, 1.0, 0.1, 0.3, True)
+    assert np.isclose(sc["ev"], 0.9) and np.isclose(sc["worst"], 0.9)
+    t = make_synthetic_tape(2)
+    t.bsp = np.full(t.n_runners, 5.0, np.float32)
+    p = str(tmp_path / "20260101_0000_Test_1_3.npz")
+    t.save(p)
+    for r in study_tape(p):
+        assert 0 <= r["filled"] <= 1
+        if r["filled"] > 0:
+            assert np.isfinite(r["aggressive_ev"])
