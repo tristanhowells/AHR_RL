@@ -28,6 +28,7 @@ ahr_rl/
   live/bot.py              market discovery + streaming loop (paper by default)
   live/betfair_exchange.py real order routing via betfairlightweight (untested live)
 notebooks/AHR_RL_train_colab.ipynb   full pipeline on Drive data
+notebooks/race_deep_dive.ipynb       one random race: facts, runner summary, volume/price/relative-price charts
 tests/                               simulator maths + live/offline parity
 ```
 
