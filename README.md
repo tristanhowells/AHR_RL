@@ -24,6 +24,7 @@ ahr_rl/
   evaluate.py    evaluation + baselines (do-nothing, random, rule-based scalper)
   report.py      held-out test report
   synthetic.py   races with a planted edge (sanity check for the learner)
+  market_study.py tradeability x signals, crossed, with train->holdout trading tests
   jump_study.py  event study: follow or fade price jumps and WAP displacement
   live/session.py          one live market: stream -> same env/policy code path
   live/bot.py              market discovery + streaming loop (paper by default)
@@ -133,6 +134,7 @@ python -m ahr_rl.report --run runs/ppo_v2            # writes gate.json
 | `feature_study.py` | Which engineered features add signal? |
 | `signal_bot.py` (`--diagnose`) | Does the edge survive realistic execution, and how much is fill modelling? |
 | `continuous.py`, `compare.py` | Continuous allocation spec with PPO vs SAC |
+| `market_study.py` | Which runners are tradeable (market share, rank, time to off), which signals (WoM, WAP, price and volume rate of change) carry information, how they cross, and can any of it be traded? |
 | `jump_study.py` | After a sudden price jump, or once a price leaves its session WAP, does it keep going or come back, and can you trade it? |
 
 ## Live trading
