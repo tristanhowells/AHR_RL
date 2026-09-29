@@ -26,10 +26,12 @@ def test_study_runs_on_a_tape(tmp_path):
     t = make_synthetic_tape(0)
     p = str(tmp_path / "20260101_0000_Test_1_1.npz")
     t.save(p)
-    rows = study_tape(p, horizons=(5, 30))
+    rows = study_tape(p, horizons=(5, 30, "start"))
     assert rows, "expected at least control rows"
-    kinds = {r["kind"] for r in rows}
-    assert "control" in kinds
+    events = {r["event"] for r in rows}
+    assert "control" in events
     for r in rows:
         assert r["price"] <= 30 and r["spread"] <= 3
-        assert r["kind"] == "control" or abs(r["jump_ticks"]) >= r["J"]
+        assert r["event"] == "control" or abs(r["jump_ticks"]) >= r["J"]
+        # the scheduled-start exit only exists for events before the start
+        assert (r["t_rel"] < 0) or np.isnan(r["cont_start"])
