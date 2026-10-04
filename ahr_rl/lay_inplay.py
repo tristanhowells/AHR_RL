@@ -1,4 +1,9 @@
-"""Lay the n-th favourite pre-off, hedge in-play: does it make money?
+"""Lay (or back) the n-th favourite pre-off, hedge in-play: does it make money?
+
+Both directions are tested:
+  side=lay   lay pre-off, resting BACK at lay price x k (fills if the runner trades UP)
+  side=back  back pre-off, resting LAY at back price / k (fills if the runner trades
+             DOWN: winners almost always do in-running, and so do losers that lead and fade)
 
 The idea: lay a fancied runner before the off, and leave a resting BACK order at a
 higher price that persists into the race (Betfair "keep" bets). If the runner trades
@@ -19,7 +24,10 @@ No hindsight: the hedge price is fixed when the lay is placed (lay price x k).
            market result:
              hedged:   lay x at L, back x*L/B at B  ->  green  x * (1 - L/B)
              unhedged: runner loses -> +x, runner wins -> -x * (L - 1)
-  also     "no hedge": the plain lay held to the result (is the lay itself value?).
+  back side: back $1 at the best back price P, resting lay at the first tick <= P / k
+             (through = one tick lower). hedged: green (P/B - 1); unhedged: win -> P - 1,
+             lose -> -1. P&L per $1 backed.
+  also     "no hedge": the plain bet held to the result (is the bet itself value?).
 
 Per-race results are averaged with t-stats across races; rules (with >= --min-races
 train races) are picked on TRAIN days and scored once on HOLDOUT days; "edge" needs
@@ -65,15 +73,16 @@ def race_rows(path: str, max_rank: int = MAX_RANK) -> list[dict]:
     went_ip = False
     ip_max, ip_min = {}, {}          # in-play traded price range per runner
     pre_max_after = {}               # checkpoint -> {sid: max traded price after that checkpoint, pre-off}
+    pre_min_after = {}               # same, min
     commission = None
 
     def snapshot():
         out = {}
         for r in cache.active_runners():
             bl, ls = r.best_lay()
-            bb, _ = r.best_back()
+            bb, bs = r.best_back()
             if bl > 0 and bb > 0:
-                out[r.selection_id] = (bl, ls, (bl * bb) ** 0.5)
+                out[r.selection_id] = (bl, ls, (bl * bb) ** 0.5, bb, bs)
         return out
 
     for m in rec.messages:
@@ -89,6 +98,7 @@ def race_rows(path: str, max_rank: int = MAX_RANK) -> list[dict]:
                     if len(snap) >= 2:
                         snaps[name] = snap
                         pre_max_after[name] = {}
+                        pre_min_after[name] = {}
                         del pending[name]
         if cache.in_play:
             went_ip = True
@@ -97,9 +107,10 @@ def race_rows(path: str, max_rank: int = MAX_RANK) -> list[dict]:
                 ip_min[sid] = min(ip_min.get(sid, 1e9), price)
         else:
             for name in pre_max_after:
-                d = pre_max_after[name]
+                d, e = pre_max_after[name], pre_min_after[name]
                 for sid, price, vol in trades:
                     d[sid] = max(d.get(sid, 0.0), price)
+                    e[sid] = min(e.get(sid, 1e9), price)
             if cache.status == "OPEN":
                 last_pre = snapshot()
                 if "last" in pre_max_after:
@@ -108,34 +119,56 @@ def race_rows(path: str, max_rank: int = MAX_RANK) -> list[dict]:
         return []
     snaps["last"] = last_pre
     pre_max_after.setdefault("last", {})
+    pre_min_after.setdefault("last", {})
     comm = (commission or 8.0) / 100.0
     race = os.path.basename(path).split(".ndjson")[0]
     rows = []
     for cp, snap in snaps.items():
         ranked = sorted(snap.items(), key=lambda kv: kv[1][2])
-        for rank, (sid, (L, size, mid)) in enumerate(ranked[:max_rank], 1):
-            if size < 5.0 or L > 50:
-                continue
+        for rank, (sid, (L, size, mid, Pb, bsize)) in enumerate(ranked[:max_rank], 1):
             won = sid == winner
-            # highest price traded after the lay: rest of the pre-off period, then in-running
+            # price range traded after entry: rest of the pre-off period, then in-running
             hi = max(pre_max_after.get(cp, {}).get(sid, 0.0), ip_max.get(sid, 0.0))
-            rec_ = dict(race=race, day=race[:8], checkpoint=cp, rank=rank, lay=L, won=won, comm=comm,
-                        ip_max=ip_max.get(sid, np.nan), ip_min=ip_min.get(sid, np.nan), hi_after=hi)
-            unhedged = (1.0 * (1 - comm)) if not won else -(L - 1)
-            rec_["no_hedge"] = unhedged
-            for k in KS:
-                bt = price_to_tick(L * k)
-                if PRICES[bt] < L * k:
-                    bt += 1
-                B = float(PRICES[min(bt, len(PRICES) - 1)])
-                B_through = float(PRICES[min(bt + 1, len(PRICES) - 1)])
-                green = (1 - L / B)
-                green = green * (1 - comm) if green > 0 else green
-                for mode, need in (("touch", B), ("through", B_through)):
-                    hit = hi >= need - 1e-9
-                    rec_[f"k{k}_{mode}_hit"] = hit
-                    rec_[f"k{k}_{mode}"] = green if hit else unhedged
-            rows.append(rec_)
+            lo = min(pre_min_after.get(cp, {}).get(sid, 1e9), ip_min.get(sid, 1e9))
+            base = dict(race=race, day=race[:8], checkpoint=cp, rank=rank, won=won, comm=comm,
+                        ip_max=ip_max.get(sid, np.nan), ip_min=ip_min.get(sid, np.nan), hi_after=hi, lo_after=lo)
+            # ---- lay first, hedge with a back that fills if the price goes UP
+            if size >= 5.0 and L <= 50:
+                rec_ = dict(base, side="lay", price=L)
+                unhedged = (1.0 * (1 - comm)) if not won else -(L - 1)
+                rec_["no_hedge"] = unhedged
+                for k in KS:
+                    bt = price_to_tick(L * k)
+                    if PRICES[bt] < L * k:
+                        bt += 1
+                    B = float(PRICES[min(bt, len(PRICES) - 1)])
+                    B_through = float(PRICES[min(bt + 1, len(PRICES) - 1)])
+                    green = (1 - L / B)
+                    green = green * (1 - comm) if green > 0 else green
+                    for mode, need in (("touch", B), ("through", B_through)):
+                        hit = hi >= need - 1e-9
+                        rec_[f"k{k}_{mode}_hit"] = hit
+                        rec_[f"k{k}_{mode}"] = green if hit else unhedged
+                rows.append(rec_)
+            # ---- back first, hedge with a lay that fills if the price goes DOWN
+            if bsize >= 5.0 and Pb <= 50:
+                rec_ = dict(base, side="back", price=Pb)
+                unhedged = ((Pb - 1) * (1 - comm)) if won else -1.0
+                rec_["no_hedge"] = unhedged
+                for k in KS:
+                    bt = price_to_tick(Pb / k)
+                    if PRICES[bt] > Pb / k:
+                        bt -= 1
+                    bt = max(bt, 0)
+                    B = float(PRICES[bt])
+                    B_through = float(PRICES[max(bt - 1, 0)])
+                    green = Pb / B - 1
+                    green = green * (1 - comm) if green > 0 else green
+                    for mode, need in (("touch", B), ("through", B_through)):
+                        hit = lo <= need + 1e-9 and B < Pb
+                        rec_[f"k{k}_{mode}_hit"] = hit
+                        rec_[f"k{k}_{mode}"] = green if hit else unhedged
+                rows.append(rec_)
     return rows
 
 
@@ -184,24 +217,28 @@ def main(argv=None):
     df.to_parquet(os.path.join(a.out, "lays.parquet"), index=False)
     print(f"{df['race'].nunique()} races with in-play data and a winner\n")
 
-    print("=" * 100 + "\nHOW OFTEN DOES THE n-th FAVOURITE (at T-10m) TRADE UP AFTER THE LAY? (all days)\n" + "=" * 100)
-    d10 = df[df["checkpoint"] == "T-10m"]
-    rows_h = []
-    for rank, g in d10.groupby("rank"):
-        rec = dict(rank=rank, races=len(g), win_rate=g["won"].mean() * 100, avg_lay=g["lay"].mean(),
-                   implied_win=(1 / g["lay"]).mean() * 100, no_hedge=g["no_hedge"].mean())
-        for k in KS:
-            rec[f"reach x{k}"] = g[f"k{k}_through_hit"].mean() * 100
-        rec["winners reach x1.25"] = g.loc[g["won"], "k1.25_through_hit"].mean() * 100 if g["won"].any() else np.nan
-        rows_h.append(rec)
-    print(pd.DataFrame(rows_h).round(2).to_string(index=False))
+    for side, word in (("lay", "UP (x k)"), ("back", "DOWN (/ k)")):
+        print("=" * 100 + f"\n{side.upper()} FIRST: how often does the n-th favourite (at T-10m) trade {word} after "
+              "entry? (all days, 'through' fills)\n" + "=" * 100)
+        d10 = df[(df["checkpoint"] == "T-10m") & (df["side"] == side)]
+        rows_h = []
+        for rank, g in d10.groupby("rank"):
+            rec = dict(rank=rank, races=len(g), win_rate=g["won"].mean() * 100, avg_price=g["price"].mean(),
+                       implied_win=(1 / g["price"]).mean() * 100, no_hedge=g["no_hedge"].mean())
+            for k in KS:
+                rec[f"hedged k{k}"] = g[f"k{k}_through_hit"].mean() * 100
+            rec["winners hedged k1.25"] = g.loc[g["won"], "k1.25_through_hit"].mean() * 100 if g["won"].any() else np.nan
+            rec["losers hedged k1.25"] = g.loc[~g["won"], "k1.25_through_hit"].mean() * 100
+            rows_h.append(rec)
+        print(pd.DataFrame(rows_h).round(2).to_string(index=False))
+        print()
 
-    print("\n" + "=" * 100 + "\nP&L PER $1 LAID (after commission), by favourite rank, entry time and hedge price; "
-          "t across races\n" + "=" * 100)
+    print("\n" + "=" * 100 + "\nP&L PER $1 STAKED (after commission), by side, favourite rank, entry time and hedge "
+          "price; t across races\n" + "=" * 100)
     res = []
-    for (cp, rank), g in df.groupby(["checkpoint", "rank"]):
+    for (side, cp, rank), g in df.groupby(["side", "checkpoint", "rank"]):
         for col in ["no_hedge"] + [f"k{k}_{m}" for k in KS for m in ("touch", "through")]:
-            rec = dict(checkpoint=cp, rank=rank, rule=col)
+            rec = dict(side=side, checkpoint=cp, rank=rank, rule=col)
             for sp, gg in g.groupby("split"):
                 rt = _race_t(gg[col], gg["race"])
                 rec.update({f"{sp}_n": rt["n"], f"{sp}_mean": rt["mean"], f"{sp}_t": rt["t"]})
@@ -213,17 +250,21 @@ def main(argv=None):
     piv = R[R["rule"].str.endswith("through") | (R["rule"] == "no_hedge")].copy()
     piv["all_mean"] = (piv["train_mean"] * piv["train_n"] + piv["holdout_mean"].fillna(0) * piv["holdout_n"].fillna(0)) / \
         (piv["train_n"] + piv["holdout_n"].fillna(0))
-    for cp in CHECKPOINTS:
-        t = piv[piv["checkpoint"] == cp].pivot(index="rank", columns="rule", values="all_mean")
-        t = t[["no_hedge"] + [f"k{k}_through" for k in KS]]
-        print(f"\n--- lay at {cp}: mean P&L per $1 laid, all days (conservative 'through' fills) ---")
-        print(t.round(4).to_string())
+    for side in ("lay", "back"):
+        for cp in CHECKPOINTS:
+            t = piv[(piv["checkpoint"] == cp) & (piv["side"] == side)].pivot(index="rank", columns="rule",
+                                                                              values="all_mean")
+            if t.empty:
+                continue
+            t = t[["no_hedge"] + [f"k{k}_through" for k in KS]]
+            print(f"\n--- {side} at {cp}: mean P&L per $1, all days (conservative 'through' fills) ---")
+            print(t.round(4).to_string())
 
     best = R[R["train_n"] >= a.min_races].sort_values("train_t", ascending=False)
     if best.empty:
         raise SystemExit(f"no rule has >= {a.min_races} train races (lower --min-races)")
     print("\n" + "=" * 100 + "\nTOP 10 RULES ON TRAIN DAYS, with HOLDOUT\n" + "=" * 100)
-    cols = ["checkpoint", "rank", "rule", "hedged_%", "train_n", "train_mean", "train_t", "holdout_n", "holdout_mean",
+    cols = ["side", "checkpoint", "rank", "rule", "hedged_%", "train_n", "train_mean", "train_t", "holdout_n", "holdout_mean",
             "holdout_t"]
     print(best[cols].head(10).round(4).to_string(index=False))
     b = best.iloc[0].to_dict()
