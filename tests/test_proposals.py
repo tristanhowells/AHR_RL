@@ -72,6 +72,14 @@ def test_pair_study(tmp_path):
     t.save(p)
     df = sample_tape(p)
     assert df is not None and len(df)
+    # a k=1 ladder is a single k=1 pair; longer ladders use at least one leg
+    for side in ("back", "lay"):
+        for st in ("close", "bsp", "hold"):
+            single = pair_pnl(df, side, 1, st, "through")[0]
+            lad = df[f"lad_{side}_1_{st}"].to_numpy(float)
+            m = np.isfinite(single) & np.isfinite(lad)
+            assert m.any() and np.allclose(single[m], lad[m], atol=1e-4)
+            assert (df[f"ladn_{side}_8_{st}"] >= df[f"ladn_{side}_1_{st}"]).all()
     for side in ("back", "lay"):
         for k in KS:
             fs = df[f"fs_{side}_{k}_through"]

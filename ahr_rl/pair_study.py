@@ -31,6 +31,8 @@ This answers the question before any RL is trained on the action spec:
      TRAIN days (models fitted on the first three quarters), then refitted on all
      TRAIN days and scored once on HOLDOUT days. "edge" = holdout mean > 0, t > 2,
      >= 20 races.
+  E  One k-tick pair vs a ladder of k=1 pairs (re-enter each time a hedge fills) to
+     the same target: same gross move, but every leg pays the spread again.
   D  A $500 bank per race, $10 pairs, on HOLDOUT races: the model policy vs a
      random policy making as many pairs, vs the oracle. Each open pair locks its
      worst loss until it is hedged or settled; no pair if funds don't cover it.
@@ -172,6 +174,11 @@ def sample_tape(path: str, every_s: float = 10.0, stake: float = STAKE) -> pd.Da
                             thr = h + 1 if fill == "through" else h
                             hit = cm >= thr
                         rec[f"fs_{side}_{kk}_{fill}"] = lo + int(hit.argmax()) if len(hit) and hit.any() else -1
+                legs = _ladder_legs(tape, valid, tmin if side == "back" else tmax, r, s, side, end, stake)
+                for kk in KS:
+                    for st in SETTLES:
+                        v, n = _ladder_value(tape, r, legs, side, kk, st, s_close, comm, rec["win"] == 1)
+                        rec[f"lad_{side}_{kk}_{st}"], rec[f"ladn_{side}_{kk}_{st}"] = v, n
             rows.append(rec)
     if not rows:
         return None
@@ -180,6 +187,81 @@ def sample_tape(path: str, every_s: float = 10.0, stake: float = STAKE) -> pd.Da
         if df[c].dtype == np.float64:
             df[c] = df[c].astype(np.float32)
     return df
+
+
+# ----------------------------------------------------------------- k=1 ladder
+MAX_LEGS = 25
+
+
+def _ladder_legs(tape: Tape, valid, textreme, r: int, s: int, side: str, end: int, stake: float) -> list[tuple]:
+    """Chain of k=1 pairs: enter (crossing the spread), rest the hedge one tick better; when
+    it fills ('through'), re-enter at once at the new best price with another k=1 pair.
+    Runs until a hedge doesn't fill, the book is gone, the price is max(KS) ticks past the
+    first entry, or MAX_LEGS. Each leg is (s_in, p_in, filled fraction, stake, hedge tick,
+    hedge fill step or -1). The first leg puts up to $10 at risk; every re-entry is sized
+    to the amount the first leg actually got matched for, so exposure stays constant."""
+    ticks, sizes = (tape.back_tick, tape.back_size) if side == "back" else (tape.lay_tick, tape.lay_size)
+    legs, d, e_first, risk = [], s, None, stake
+    while len(legs) < MAX_LEGS:
+        s_in = d + 1
+        if s_in > end or not valid[s_in, r]:
+            break
+        e0 = int(ticks[s_in, r, 0])
+        st = risk if side == "back" else risk / max(PRICES[e0] - 1, 0.01)
+        p_in, f = _walk(ticks[s_in, r], sizes[s_in, r], st, 2)
+        if not np.isfinite(p_in) or f <= 0:
+            break
+        if e_first is None:
+            e_first = e0
+            risk = st * f * (1.0 if side == "back" else p_in - 1)
+        h = int(np.clip(e0 - 1 if side == "back" else e0 + 1, 0, N_TICKS - 1))
+        lo = d + 3  # entry lands at d+1, the hedge one step later
+        seg = textreme[lo:end + 1, r]
+        hit = seg <= h - 1 if side == "back" else seg >= h + 1
+        fs = lo + int(hit.argmax()) if len(hit) and hit.any() else -1
+        legs.append((s_in, p_in, f, st, h, fs, e_first))
+        if fs < 0 or (h <= e_first - max(KS) if side == "back" else h >= e_first + max(KS)):
+            break
+        d = fs
+    return legs
+
+
+def _ladder_value(tape: Tape, r: int, legs, side: str, k: int, settle: str, s_close: int, comm: float,
+                  win: bool):
+    """The k=1 ladder that stops once a hedge k ticks past the first entry has filled.
+    Returns (P&L per $1 at risk on the first leg, legs used). 'close' only uses legs
+    entered before the scheduled start and greens the open one at market there; 'bsp' /
+    'hold' settle the open leg at BSP / on the result. Commission is charged per leg
+    (as for the single pair)."""
+    if not legs:
+        return np.nan, 0
+    e_first = legs[0][6]
+    s_in0, p0, f0, st0 = legs[0][:4]
+    risk0 = st0 * f0 * (1.0 if side == "back" else p0 - 1)
+    usd, n = 0.0, 0
+    for s_in, p_in, f, st, h, fs, _ in legs:
+        if settle == "close" and s_in >= s_close:
+            break  # no new entries after the auto-green
+        n += 1
+        if fs >= 0 and (settle != "close" or fs <= s_close):
+            usd += st * f * float(_green(side, p_in, PRICES[h], comm))
+            if (h <= e_first - k) if side == "back" else (h >= e_first + k):
+                break  # reached the single pair's target: stop, flat
+            continue
+        # this leg is still open at the off / scheduled start
+        if settle == "close":
+            g = _round_trip(tape, r, s_in, s_close, side, st, comm)[0]
+        elif settle == "bsp":
+            g = float(_green(side, p_in, float(tape.bsp[r]), comm))
+        elif side == "back":
+            g = (p_in - 1) * (1 - comm) if win else -1.0
+        else:
+            g = -(p_in - 1) if win else 1 - comm
+        if not np.isfinite(g):
+            return np.nan, n
+        usd += st * f * g
+        break
+    return usd / risk0, n
 
 
 def _one(args):
@@ -222,6 +304,25 @@ def pair_pnl(df: pd.DataFrame, side: str, k: int, settle: str, fill: str):
         g = g / (p_in - 1)
     g = np.where(np.isfinite(p_in) & (e0 >= 0), g, np.nan)
     return g, filled, np.where(filled, fs, last)
+
+
+def ladder_table(df: pd.DataFrame, fill: str = "through") -> pd.DataFrame:
+    """Single k-tick pair vs a chain of k=1 pairs that stops at the same target, on the
+    same decisions. diff = ladder - single, race-clustered t on the per-decision gap."""
+    out = []
+    race = df["race"].to_numpy()
+    for side in SIDES:
+        for k in KS:
+            for st in SETTLES:
+                single = pair_pnl(df, side, k, st, fill)[0]
+                lad = df[f"lad_{side}_{k}_{st}"].to_numpy(float)
+                m = np.isfinite(single) & np.isfinite(lad)
+                d = race_t((lad[m] - single[m]) * 100, race[m])
+                out.append(dict(side=side, k=k, settle=st, single_pct=np.mean(single[m]) * 100,
+                                ladder_pct=np.mean(lad[m]) * 100, diff_pct=d["mean"], diff_t=d["t"],
+                                legs=df[f"ladn_{side}_{k}_{st}"].to_numpy(float)[m].mean(),
+                                ladder_pos_pct=(lad[m] > 0).mean() * 100, n=int(m.sum())))
+    return pd.DataFrame(out)
 
 
 def configs():
@@ -383,8 +484,11 @@ def main(argv=None):
     paths = list_tapes(a.tapes)[: a.max_races]
     tr, va, te = split_by_date(paths)
     hold_days = {os.path.basename(p)[:8] for p in va + te}
-    if os.path.exists(cache):
-        df = pd.read_parquet(cache)
+    df = pd.read_parquet(cache) if os.path.exists(cache) else None
+    if df is not None and "lad_back_1_close" not in df.columns:
+        print(f"{cache} predates the ladder variant: rebuilding")
+        df = None
+    if df is not None:
         print(f"loaded {cache}")
     else:
         os.environ["OMP_NUM_THREADS"] = "1"
@@ -478,6 +582,17 @@ def main(argv=None):
     ])
     bank.to_csv(os.path.join(a.out, "bank_sim.csv"), index=False)
     print(bank.round(2).to_string(index=False))
+
+    # ---------------- E
+    print("\n=== E. One k-tick pair vs a ladder of k=1 pairs to the same target (fill=through) ===")
+    print("ladder: enter, hedge 1 tick better; each time a hedge fills, re-enter at the new best price with another")
+    print("k=1 pair, until a hedge k ticks past the first entry fills. Same decisions as A; per $1 at risk on the")
+    print("first leg. k=1 is a check (ladder == single). diff = ladder - single (race-clustered t).")
+    lt = ladder_table(df)
+    lt.to_csv(os.path.join(a.out, "ladder_vs_single.csv"), index=False)
+    print(lt.round(2).to_string(index=False))
+    print("\nfavourites only:")
+    print(ladder_table(df[df["rank"] == 1]).round(2).to_string(index=False))
 
     print("\n=== Verdict ===")
     print(f"picked config k={k_b} settle={st_b} fill={a.fill}: holdout top-5% mean {pick['top5_mean_pct']:.2f}% "
