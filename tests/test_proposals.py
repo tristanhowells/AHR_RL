@@ -59,3 +59,35 @@ def test_sweep_bsp_trade(tmp_path):
         assert 0 <= r["filled"] <= 1
         if r["filled"] > 0:
             assert np.isfinite(r["aggressive_ev"])
+
+
+def test_pair_study(tmp_path):
+    from ahr_rl.ladder import PRICES
+    from ahr_rl.pair_study import KS, pair_pnl, sample_tape
+
+    t = make_synthetic_tape(3)
+    t.bsp = np.full(t.n_runners, 5.0, np.float32)
+    t.winner, t.went_in_play = 0, True
+    p = str(tmp_path / "20260101_0000_Test_1_4.npz")
+    t.save(p)
+    df = sample_tape(p)
+    assert df is not None and len(df)
+    for side in ("back", "lay"):
+        for k in KS:
+            fs = df[f"fs_{side}_{k}_through"]
+            assert ((fs == -1) | (fs >= df["s"] + 3)).all()
+            # 'through' needs a trade beyond the hedge price, so it can't fill before 'touch'
+            ft = df[f"fs_{side}_{k}_touch"]
+            assert ((fs == -1) | ((ft >= 0) & (ft <= fs))).all()
+    # hand-built row: back 5.0 hedged two ticks lower (4.8) -> 5/4.8 - 1 after commission
+    e0 = int(np.argmin(np.abs(PRICES - 5.0)))
+    row = {c: [v] for c, v in dict(back_p=5.0, back_e0=e0, comm=0.1, s_close=50, end=60, back_gclose=-0.05,
+                                   bsp=6.0, win=0, fs_back_2_through=55).items()}
+    d = pd.DataFrame(row)
+    g, filled, done = pair_pnl(d, "back", 2, "close", "through")
+    assert filled[0] == False and np.isclose(g[0], -0.05) and done[0] == 50  # filled after the close
+    g, filled, done = pair_pnl(d, "back", 2, "bsp", "through")
+    assert filled[0] and np.isclose(g[0], (5.0 / PRICES[e0 - 2] - 1) * 0.9) and done[0] == 55
+    d["fs_back_2_through"] = -1
+    assert np.isclose(pair_pnl(d, "back", 2, "bsp", "through")[0][0], 5.0 / 6.0 - 1)
+    assert np.isclose(pair_pnl(d, "back", 2, "hold", "through")[0][0], -1.0)
