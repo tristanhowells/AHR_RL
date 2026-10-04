@@ -141,6 +141,7 @@ python -m ahr_rl.report --run runs/ppo_v2            # writes gate.json
 | `leadlag_study.py` | Does an outside price (bookmaker/tote CSV; projected BSP until one exists) lead the exchange, and can the gap be traded? |
 | `sweep_passive.py` | After a sweep, does a resting order on the snap-back side make money in the full queue-aware simulator? |
 | `sweep_bsp.py` | The post-sweep fade, tuned (take-profit, hold) with a BSP exit and no look-ahead on the off time |
+| `lay_inplay.py` | Lay the n-th favourite pre-off and hedge with a resting back that persists in-play: does it pay? |
 | `community.py` | The pre-off rules traders automate (WOM scalp, pressure scalp, gap fill, volume levels, spoofs, scratchings, arbitrage), tested honestly |
 | `jump_study.py` | After a sudden price jump, or once a price leaves its session WAP, does it keep going or come back, and can you trade it? |
 
