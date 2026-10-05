@@ -153,7 +153,7 @@ def _setup(args):
     os.makedirs(args.out, exist_ok=True)
     tr, va, te = split_by_date(list_tapes(args.tapes))
     json.dump({"train": tr, "val": va, "test": te}, open(os.path.join(args.out, "split.json"), "w"), indent=1)
-    cfg = ContinuousConfig(random_start_s=30.0)
+    cfg = ContinuousConfig(random_start_s=30.0, max_fraction=getattr(args, "max_fraction", 1.0))
     json.dump({**vars(args), "env": asdict(cfg)}, open(os.path.join(args.out, "config.json"), "w"), indent=1,
               default=str)
     fns = [(lambda i=i: ContinuousAllocEnv(tr, cfg, seed=args.seed + i)) for i in range(args.n_envs)]
@@ -194,6 +194,61 @@ def _maybe_eval(args, actor, cfg, va, it, best, logf, stats, t0, steps, device):
 
 
 # ============================================================================ SAC
+class RandomStrategies:
+    """Warm-up exploration (no learning yet, nothing at stake).
+
+    iid       a fresh random action every step, small wager fraction (the original
+              warm-up). It churns: entries are undone by the next step's noise, so
+              it rarely shows the critic what holding a position does.
+    episodic  a random *strategy* held for a whole race: conviction per runner =
+              tanh(gain * (w . runner features + v . market features + b)) with a
+              random sparse w, v, b, gain and wager fraction. Like parameter-space
+              noise / random search, it tries consistent, state-dependent behaviours
+              (e.g. "back runners whose feature 7 is high, late in the market") that
+              per-step noise can't express.
+    mixed     each race picks one of the two (default for the black-box run)."""
+
+    def __init__(self, n_envs: int, n_feat: int, n_glob: int, mode: str = "iid", max_fraction: float = 1.0,
+                 seed: int = 0):
+        self.n, self.F, self.G, self.mode = n_envs, n_feat, n_glob, mode
+        self.fmax = min(max_fraction, 0.3)
+        self.rng = np.random.default_rng(seed + 12345)
+        self.kind = [""] * n_envs
+        self.params = [None] * n_envs
+        for i in range(n_envs):
+            self._new(i)
+
+    def _new(self, i):
+        rng = self.rng
+        kind = self.mode if self.mode != "mixed" else ("episodic" if rng.random() < 0.5 else "iid")
+        self.kind[i] = kind
+        if kind == "episodic":
+            w = rng.normal(0, 1, self.F) * (rng.random(self.F) < rng.uniform(0.1, 0.5))
+            v = rng.normal(0, 1, self.G) * (rng.random(self.G) < 0.3)
+            self.params[i] = dict(w=w / np.sqrt(max((w != 0).sum(), 1)), v=v / np.sqrt(max((v != 0).sum(), 1)),
+                                  b=rng.normal(0, 0.5), gain=rng.uniform(1, 4),
+                                  f=rng.uniform(0, 1) ** 2 * self.fmax)
+
+    def episode_done(self, done):
+        for i in np.nonzero(done)[0]:
+            self._new(int(i))
+
+    def act(self, obs) -> np.ndarray:
+        act = np.zeros((self.n, N_CONT), np.float32)
+        for i in range(self.n):
+            if self.kind[i] == "episodic":
+                p = self.params[i]
+                z = obs["runners"][i].astype(np.float64) @ p["w"] + float(obs["global"][i] @ p["v"]) + p["b"]
+                act[i, :R_MAX] = np.tanh(p["gain"] * z)
+                act[i, -1] = p["f"]
+            else:
+                # small wager fraction: uniform f would bet half the bank every 2s
+                act[i, :R_MAX] = self.rng.uniform(-1, 1, R_MAX)
+                act[i, -1] = self.rng.uniform(0, 1) ** 3 * self.fmax
+        act[:, :R_MAX] *= obs["mask"]
+        return act
+
+
 def train_sac(args):
     cfg, venv, va = _setup(args)
     device = torch.device(args.device)
@@ -228,13 +283,10 @@ def train_sac(args):
     logf.write("iter,steps,sps,ep_green_mean,ep_turnover_mean,val_green,val_pct_green,val_turnover\n")
     stats, best, steps, t0 = [], [-np.inf], 0, time.time()
     n_iters = args.total_steps // N
+    explorer = RandomStrategies(N, F, G, args.warmup_mode, getattr(args, "max_fraction", 1.0), args.seed)
     for it in range(1, n_iters + 1):
         if steps < args.warmup:
-            # random exploration with a small wager fraction (uniform f would bet
-            # half the bank every 2s and wipe out any useful signal)
-            act = np.random.uniform(-1, 1, (N, N_CONT)).astype(np.float32)
-            act[:, -1] = np.random.uniform(0, 1, N) ** 3 * 0.3
-            act[:, :R_MAX] *= obs["mask"]
+            act = explorer.act(obs)
         else:
             with torch.no_grad():
                 _, a, _, _, _ = actor.sample(*obs_t(obs, device))
@@ -242,6 +294,7 @@ def train_sac(args):
         nobs, rew, term, trunc, info = venv.step(act)
         _episode_stats(info, stats)
         done = np.logical_or(term, trunc)
+        explorer.episode_done(done)
         # SAME_STEP autoreset: the true next obs of finished envs is in final_obs
         nxt = {k: nobs[k].copy() for k in ("runners", "global", "mask")}
         if "final_obs" in info:
@@ -389,6 +442,9 @@ def parse_args(argv=None):
     ap.add_argument("--buffer", type=int, default=150_000)
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--warmup", type=int, default=10_000)
+    ap.add_argument("--warmup-mode", default="iid", choices=["iid", "episodic", "mixed"],
+                    help="random exploration before learning starts (see RandomStrategies)")
+    ap.add_argument("--max-fraction", type=float, default=1.0, help="cap on the share of funds wagered per step")
     ap.add_argument("--update-every", type=int, default=1)
     ap.add_argument("--grad-steps", type=int, default=1)
     ap.add_argument("--tau", type=float, default=0.005)

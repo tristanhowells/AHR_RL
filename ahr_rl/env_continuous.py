@@ -39,6 +39,7 @@ class ContinuousConfig(EnvConfig):
     deadzone: float = 0.05  # |a_r| below this -> runner gets nothing
     min_fraction: float = 0.01  # f below this -> no bets this step
     temperature: float = 0.25  # softmax temperature over |a_r|
+    max_fraction: float = 1.0  # cap on f (share of available funds wagered per step)
 
 
 class ContinuousAllocEnv(BetfairPreRaceEnv):
@@ -51,7 +52,7 @@ class ContinuousAllocEnv(BetfairPreRaceEnv):
     def _apply(self, action):
         ex, cfg = self.ex, self.cfg
         a = np.clip(np.asarray(action, np.float64)[:R_MAX], -1, 1)
-        f = float(np.clip(action[R_MAX], 0.0, 1.0))
+        f = float(np.clip(action[R_MAX], 0.0, cfg.max_fraction))
         ex.cancel_all()  # aggressive-only: leftovers from the last decision are pulled
         if f < cfg.min_fraction:
             return

@@ -63,12 +63,12 @@ def make_synthetic_tape(seed: int, n_runners: int = 6, dt: float = 0.5, pre_s: f
     )
 
 
-def write_synthetic(out_dir: str, n: int, seed0: int = 0) -> list[str]:
+def write_synthetic(out_dir: str, n: int, seed0: int = 0, trend_every_s: float = 6.0) -> list[str]:
     os.makedirs(out_dir, exist_ok=True)
     paths = []
     for i in range(n):
         p = os.path.join(out_dir, f"2099{(i % 28) + 1:04d}_syn_{seed0 + i}.npz")
-        make_synthetic_tape(seed0 + i).save(p)
+        make_synthetic_tape(seed0 + i, trend_every_s=trend_every_s).save(p)
         paths.append(p)
     return paths
 

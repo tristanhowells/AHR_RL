@@ -147,3 +147,34 @@ def test_seq_frames_no_lookahead(tmp_path):
     t.save(p2)
     X2, Y2 = tape_frames(p2, rows.iloc[:1], 60.0, 2.0)
     assert np.array_equal(X1[:1], X2)
+
+
+def test_blackbox_explorer_and_cap():
+    from ahr_rl.continuous import RandomStrategies
+    from ahr_rl.env_continuous import N_CONT, ContinuousAllocEnv, ContinuousConfig
+    from ahr_rl.features import R_MAX
+
+    n, F, G = 3, 10, 5
+    ex = RandomStrategies(n, F, G, "episodic", max_fraction=0.1, seed=0)
+    rng = np.random.default_rng(0)
+    obs = dict(runners=rng.normal(size=(n, R_MAX, F)).astype(np.float32),
+               global_=None, mask=np.zeros((n, R_MAX), np.float32))
+    obs["global"] = rng.normal(size=(n, G)).astype(np.float32)
+    obs["mask"][:, :6] = 1
+    a1 = ex.act(obs)
+    assert a1.shape == (n, N_CONT) and (a1[:, 6:R_MAX] == 0).all() and (a1[:, -1] <= 0.1 + 1e-9).all()
+    # an episodic strategy is a fixed function of the state within a race ...
+    assert np.allclose(a1, ex.act(obs))
+    # ... and a new one is drawn when the race ends
+    ex.episode_done(np.array([True, False, False]))
+    a2 = ex.act(obs)
+    assert not np.allclose(a1[0], a2[0]) and np.allclose(a1[1:], a2[1:])
+    # the wager cap holds in the env
+    t = make_synthetic_tape(6)
+    env = ContinuousAllocEnv([t], ContinuousConfig(max_fraction=0.02))
+    o, _ = env.reset(options={"tape": t})
+    a = np.zeros(N_CONT, np.float32)
+    a[:6] = 1.0
+    a[-1] = 1.0  # asks for the whole bank
+    env.step(a)
+    assert env.ex.turnover <= 0.02 * 500 + 1e-6
