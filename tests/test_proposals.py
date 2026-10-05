@@ -99,3 +99,30 @@ def test_pair_study(tmp_path):
     d["fs_back_2_through"] = -1
     assert np.isclose(pair_pnl(d, "back", 2, "bsp", "through")[0][0], 5.0 / 6.0 - 1)
     assert np.isclose(pair_pnl(d, "back", 2, "hold", "through")[0][0], -1.0)
+
+
+def test_p3b_forward(tmp_path):
+    from ahr_rl.p3b_forward import decide, study_tape, summary
+    from ahr_rl.sweep_passive import find_events
+
+    base = dict(races=150, realised_per_fill=0.0, worst_per_fill=0.0, fill_pct=50.0, tp_pct=50.0)
+    assert decide(dict(base, attempts=100, ev_per_attempt=0.05, t=5.0)) == "CONTINUE"
+    assert decide(dict(base, attempts=300, ev_per_attempt=-0.001, t=-1.0)) == "FAIL"
+    assert decide(dict(base, attempts=300, ev_per_attempt=0.01, t=2.5)) == "PASS"
+    assert decide(dict(base, attempts=300, ev_per_attempt=0.01, t=1.0)) == "CONTINUE"
+    assert decide(dict(base, attempts=600, ev_per_attempt=0.01, t=1.0)) == "FAIL"
+    t = make_synthetic_tape(4)
+    t.bsp = np.full(t.n_runners, 5.0, np.float32)
+    p = str(tmp_path / "20261010_0000_Test_1_5.npz")
+    t.save(p)
+    # the live ranking only uses volume matched so far; the default keeps the at-the-off ranking
+    ev_live, _ = find_events(t, jumps=(5,), rng=np.random.default_rng(0), control_every_s=1e9, live=True)
+    ev_old, _ = find_events(t, jumps=(5,), rng=np.random.default_rng(0), control_every_s=1e9)
+    assert all(e["top3"] == e["top3_final"] for e in ev_old)
+    assert len(ev_live) >= len(ev_old)
+    rows = study_tape(p)
+    for r in rows:
+        assert 0 <= r["filled"] <= 1
+    if rows:
+        s = summary(pd.DataFrame(rows).assign(hit_tp=lambda d: d["hit_tp"].fillna(False).astype(bool)))
+        assert s["attempts"] == len(rows)

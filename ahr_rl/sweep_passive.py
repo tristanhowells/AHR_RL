@@ -56,7 +56,11 @@ GRID = dict(entry=("join", "improve"), W=(10, 30), tp=(0, 2), H=(60, 120))
 
 
 def find_events(t: Tape, jumps=(3, 5), window_s=5.0, cooldown_s=15.0, max_spread=3, max_price=30.0,
-                min_sweep_vol=20.0, control_every_s=180.0, rng=None):
+                min_sweep_vol=20.0, control_every_s=180.0, rng=None, live=False):
+    """Sweeps (and random control moments) per runner. ``top3`` ranks runners by
+    matched volume at the off (look-ahead; what P3/P3b used) unless ``live``, which
+    ranks by volume matched so far and also scans the last 40s before the off;
+    ``top3_final`` is always the at-the-off ranking."""
     dt, T = t.dt, t.n_steps
     ok = ~t.suspended.copy()
     if t.went_in_play and T > 1:
@@ -78,12 +82,14 @@ def find_events(t: Tape, jumps=(3, 5), window_s=5.0, cooldown_s=15.0, max_spread
     cv = np.vstack([np.zeros((1, t.n_runners)), np.cumsum(vol, 0)])
     matched = t.tv[end]
     rank = np.argsort(np.argsort(-np.nan_to_num(matched)))
+    rank_now = np.argsort(np.argsort(-cv[1:], axis=1), axis=1) if live else None  # [T, R], volume up to step s
+    last_s = end if live else end - int(40 / dt)
     events = []
     for r in range(t.n_runners):
         m = mid[:, r]
         for J in jumps:
             last = -10**9
-            for s in range(W, end - int(40 / dt)):
+            for s in range(W, last_s):
                 if s - last < cool or bad[s] or not np.isfinite(m[s]) or not np.isfinite(m[s - W]):
                     continue
                 d = m[s] - m[s - W]
@@ -93,7 +99,8 @@ def find_events(t: Tape, jumps=(3, 5), window_s=5.0, cooldown_s=15.0, max_spread
                     continue
                 last = s
                 events.append(dict(kind="sweep", J=J, step=s, runner=r, direction=1 if d > 0 else -1,
-                                   top3=bool(rank[r] < 3), t_rel=float(t.t_rel[s])))
+                                   top3=bool((rank_now[s, r] if live else rank[r]) < 3),
+                                   top3_final=bool(rank[r] < 3), t_rel=float(t.t_rel[s])))
         ce = int(control_every_s / dt)
         for s in range(W + int(rng.integers(0, ce)), end - int(40 / dt), ce):
             if bad[s] or not np.isfinite(m[s]) or PRICES[int(round(m[s]))] > max_price:
