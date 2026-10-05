@@ -1,7 +1,7 @@
 """P8: a "black box" search. SAC with a long, consequence-free random warm-up.
 
 No hand-made signal or rule: the agent sees the env features, acts in the continuous
-allocation spec (back / lay any runner, any size up to a cap, every 2s) and is paid
+allocation spec (back / lay any runner, any size up to a cap, every 10s) and is paid
 the change in its green value. Before it learns anything it spends --warmup-frac of
 its steps trying random strategies ("mixed": half the races a fresh random action
 every step, half a random state-dependent strategy held for the whole race; see
@@ -114,11 +114,13 @@ def forensics(actor, tapes, cfg, device) -> pd.DataFrame:
     return d
 
 
-def run_sac(tapes_glob, out, steps, warmup_frac, seed, n_envs, device, max_fraction, buffer, eval_races):
+def run_sac(tapes_glob, out, steps, warmup_frac, seed, n_envs, device, max_fraction, buffer, eval_races,
+            decision_every):
     argv = ["--algo", "sac", "--tapes", tapes_glob, "--out", out, "--total-steps", str(steps),
             "--n-envs", str(n_envs), "--seed", str(seed), "--device", device,
             "--warmup", str(int(steps * warmup_frac)), "--warmup-mode", "mixed",
-            "--max-fraction", str(max_fraction), "--buffer", str(buffer), "--update-every", "2",
+            "--max-fraction", str(max_fraction), "--decision-every", str(decision_every),
+            "--buffer", str(buffer), "--update-every", "2",
             "--eval-races", str(eval_races), "--eval-every", str(max(1, steps // n_envs // 10))]  # ~10 checkpoints
     train_sac(sac_args(argv))
     return os.path.join(out, "best.pt")
@@ -141,7 +143,8 @@ def main(argv=None):
     ap.add_argument("--steps", type=int, default=600_000, help="env steps per real-data seed")
     ap.add_argument("--warmup-frac", type=float, default=0.4, help="share of steps spent on random strategies")
     ap.add_argument("--seeds", default="0,1")
-    ap.add_argument("--max-fraction", type=float, default=0.1, help="cap on the share of funds wagered per 2s step")
+    ap.add_argument("--max-fraction", type=float, default=0.1, help="cap on the share of funds wagered per decision")
+    ap.add_argument("--decision-every", type=int, default=20, help="tape steps (0.5s) per decision; 20 = 10s")
     ap.add_argument("--buffer", type=int, default=400_000)
     ap.add_argument("--control-steps", type=int, default=150_000)
     ap.add_argument("--control-races", type=int, default=200)
@@ -156,7 +159,7 @@ def main(argv=None):
     pd.set_option("display.width", 250)
     pd.set_option("display.max_columns", 30)
     t0 = time.time()
-    cfg = ContinuousConfig(random_start_s=0.0, max_fraction=a.max_fraction)
+    cfg = ContinuousConfig(random_start_s=0.0, max_fraction=a.max_fraction, decision_every=a.decision_every)
     rows = []
 
     # ---------------- 0. positive control
@@ -168,7 +171,7 @@ def main(argv=None):
         write_synthetic(syn_dir, a.control_races, seed0=50_000, trend_every_s=a.trend_every_s)
         glob_ = os.path.join(syn_dir, "*.npz")
         ck = run_sac(glob_, os.path.join(a.out, "control"), a.control_steps, a.warmup_frac, 0, a.n_envs,
-                     a.device, a.max_fraction, a.buffer, min(a.eval_races, 30))
+                     a.device, a.max_fraction, a.buffer, min(a.eval_races, 30), a.decision_every)
         _, _, te = split_by_date(list_tapes(glob_))
         rows.append(dict(run="control", **score("do nothing", evaluate(noop_policy, te, cfg, env_cls=ContinuousAllocEnv))))
         rows.append(dict(run="control", **score("random (f=0.02)", evaluate(random_cont_policy(), te, cfg,
@@ -199,7 +202,7 @@ def main(argv=None):
         print(f"\n--- seed {sd}: {a.steps} steps, first {int(a.steps * a.warmup_frac)} on random strategies ---",
               flush=True)
         ck = run_sac(a.tapes, os.path.join(a.out, f"real_seed{sd}"), a.steps, a.warmup_frac, sd, a.n_envs, a.device,
-                     a.max_fraction, a.buffer, a.eval_races)
+                     a.max_fraction, a.buffer, a.eval_races, a.decision_every)
         actors[sd] = test_block(f"seed {sd}", ck, te, cfg, a.device, rows)
         results[sd] = (rows[-2], rows[-1])
 

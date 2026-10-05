@@ -153,7 +153,8 @@ def _setup(args):
     os.makedirs(args.out, exist_ok=True)
     tr, va, te = split_by_date(list_tapes(args.tapes))
     json.dump({"train": tr, "val": va, "test": te}, open(os.path.join(args.out, "split.json"), "w"), indent=1)
-    cfg = ContinuousConfig(random_start_s=30.0, max_fraction=getattr(args, "max_fraction", 1.0))
+    cfg = ContinuousConfig(random_start_s=30.0, max_fraction=getattr(args, "max_fraction", 1.0),
+                           decision_every=getattr(args, "decision_every", 4))
     json.dump({**vars(args), "env": asdict(cfg)}, open(os.path.join(args.out, "config.json"), "w"), indent=1,
               default=str)
     fns = [(lambda i=i: ContinuousAllocEnv(tr, cfg, seed=args.seed + i)) for i in range(args.n_envs)]
@@ -445,6 +446,7 @@ def parse_args(argv=None):
     ap.add_argument("--warmup-mode", default="iid", choices=["iid", "episodic", "mixed"],
                     help="random exploration before learning starts (see RandomStrategies)")
     ap.add_argument("--max-fraction", type=float, default=1.0, help="cap on the share of funds wagered per step")
+    ap.add_argument("--decision-every", type=int, default=4, help="tape steps (0.5s) per decision")
     ap.add_argument("--update-every", type=int, default=1)
     ap.add_argument("--grad-steps", type=int, default=1)
     ap.add_argument("--tau", type=float, default=0.005)
