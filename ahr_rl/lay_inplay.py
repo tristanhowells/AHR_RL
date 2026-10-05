@@ -31,8 +31,13 @@ No hindsight: the hedge price is fixed when the lay is placed (lay price x k).
 
 Per-race results are averaged with t-stats across races; rules (with >= --min-races
 train races) are picked on TRAIN days and scored once on HOLDOUT days; "edge" needs
-holdout mean > 0, t > 2 and >= 20 holdout races. A winner that never trades up costs
-(lay price - 1), so results are noisy: judge them on hundreds of races, not dozens.
+holdout mean > 0, t > 2 and >= 20 holdout races, a conservative ('through') or no-hedge
+rule, and a positive tail-stressed mean. A winner that never trades up costs (lay
+price - 1) and can be rare enough to be missing from a sample entirely, which makes a
+nearly-always-hedged rule look riskless (huge t). The stressed mean replaces the
+observed rate of that worst outcome by its 95% upper bound (Clopper-Pearson, all days),
+so a rule only passes if it still pays when the rare blow-up happens as often as the
+data can't rule out.
 
     python -m ahr_rl.lay_inplay --recordings "<drive>/betfair stream data/recordings" --out runs/lay_inplay
 """
@@ -189,6 +194,26 @@ def _race_t(v, race):
     return dict(n=len(x), mean=float(x["v"].mean()), t=float(t), races=len(per))
 
 
+def _stress(g: pd.DataFrame, col: str, side: str) -> dict:
+    """Worst outcome of the rule (lay: an unhedged winner, -(L-1); back: an unhedged
+    loser, -1), its observed rate on all days, its 95% upper bound, and the mean P&L
+    with the bound in place of the observed rate."""
+    from scipy.stats import beta
+
+    hit = g[col + "_hit"].to_numpy(bool) if col != "no_hedge" else np.zeros(len(g), bool)
+    won = g["won"].to_numpy(bool)
+    tail = (~hit & won) if side == "lay" else (~hit & ~won)
+    loss = -(g["price"].to_numpy(float) - 1) if side == "lay" else -np.ones(len(g))
+    n, x = len(g), int(tail.sum())
+    if n == 0:
+        return dict(tail_events=0, **{"tail_rate_%": np.nan, "tail_rate_95_%": np.nan}, stressed_mean=np.nan)
+    p_up = float(beta.ppf(0.95, x + 1, n - x)) if x < n else 1.0
+    v = g[col].to_numpy(float)
+    rest = v[~tail].mean() if (~tail).any() else 0.0
+    stressed = (1 - p_up) * rest + p_up * loss.mean()
+    return {"tail_events": x, "tail_rate_%": x / n * 100, "tail_rate_95_%": p_up * 100, "stressed_mean": stressed}
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--recordings", required=True, help="folder of *.ndjson.gz recordings (they include in-play)")
@@ -244,6 +269,7 @@ def main(argv=None):
                 rec.update({f"{sp}_n": rt["n"], f"{sp}_mean": rt["mean"], f"{sp}_t": rt["t"]})
             if col != "no_hedge":
                 rec["hedged_%"] = g[col + "_hit"].mean() * 100
+            rec.update(_stress(g, col, side))
             res.append(rec)
     R = pd.DataFrame(res)
     R.to_csv(os.path.join(a.out, "rules.csv"), index=False)
@@ -260,17 +286,19 @@ def main(argv=None):
             print(f"\n--- {side} at {cp}: mean P&L per $1, all days (conservative 'through' fills) ---")
             print(t.round(4).to_string())
 
-    best = R[R["train_n"] >= a.min_races].sort_values("train_t", ascending=False)
+    ok_rule = R["rule"].str.endswith("through") | (R["rule"] == "no_hedge")
+    best = R[(R["train_n"] >= a.min_races) & ok_rule].sort_values("train_t", ascending=False)
     if best.empty:
         raise SystemExit(f"no rule has >= {a.min_races} train races (lower --min-races)")
-    print("\n" + "=" * 100 + "\nTOP 10 RULES ON TRAIN DAYS, with HOLDOUT\n" + "=" * 100)
+    print("\n" + "=" * 100 + "\nTOP 10 RULES ON TRAIN DAYS ('through' / no-hedge only), with HOLDOUT and the "
+          "tail stress test\n" + "=" * 100)
     cols = ["side", "checkpoint", "rank", "rule", "hedged_%", "train_n", "train_mean", "train_t", "holdout_n", "holdout_mean",
-            "holdout_t"]
+            "holdout_t", "tail_events", "tail_rate_%", "tail_rate_95_%", "stressed_mean"]
     print(best[cols].head(10).round(4).to_string(index=False))
     b = best.iloc[0].to_dict()
     verdict = dict(best={k: b.get(k) for k in cols},
                    edge=bool((b.get("holdout_mean") or 0) > 0 and (b.get("holdout_t") or 0) > 2
-                             and (b.get("holdout_n") or 0) >= 20))
+                             and (b.get("holdout_n") or 0) >= 20 and (b.get("stressed_mean") or -1) > 0))
     json.dump(verdict, open(os.path.join(a.out, "verdict.json"), "w"), indent=1, default=str)
     print("\n=== Verdict ===")
     print(json.dumps(verdict, indent=1, default=str))
