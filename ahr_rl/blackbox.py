@@ -115,12 +115,12 @@ def forensics(actor, tapes, cfg, device) -> pd.DataFrame:
 
 
 def run_sac(tapes_glob, out, steps, warmup_frac, seed, n_envs, device, max_fraction, buffer, eval_races,
-            decision_every):
+            decision_every, update_every=2, grad_steps=1):
     argv = ["--algo", "sac", "--tapes", tapes_glob, "--out", out, "--total-steps", str(steps),
             "--n-envs", str(n_envs), "--seed", str(seed), "--device", device,
             "--warmup", str(int(steps * warmup_frac)), "--warmup-mode", "mixed",
             "--max-fraction", str(max_fraction), "--decision-every", str(decision_every),
-            "--buffer", str(buffer), "--update-every", "2",
+            "--buffer", str(buffer), "--update-every", str(update_every), "--grad-steps", str(grad_steps),
             "--eval-races", str(eval_races), "--eval-every", str(max(1, steps // n_envs // 10))]  # ~10 checkpoints
     train_sac(sac_args(argv))
     return os.path.join(out, "best.pt")
@@ -145,6 +145,8 @@ def main(argv=None):
     ap.add_argument("--seeds", default="0,1")
     ap.add_argument("--max-fraction", type=float, default=0.1, help="cap on the share of funds wagered per decision")
     ap.add_argument("--decision-every", type=int, default=20, help="tape steps (0.5s) per decision; 20 = 10s")
+    ap.add_argument("--update-every", type=int, default=2, help="SAC: env iterations per gradient update round")
+    ap.add_argument("--grad-steps", type=int, default=1, help="SAC: gradient steps per update round")
     ap.add_argument("--buffer", type=int, default=400_000)
     ap.add_argument("--control-steps", type=int, default=150_000)
     ap.add_argument("--control-races", type=int, default=200)
@@ -171,7 +173,8 @@ def main(argv=None):
         write_synthetic(syn_dir, a.control_races, seed0=50_000, trend_every_s=a.trend_every_s)
         glob_ = os.path.join(syn_dir, "*.npz")
         ck = run_sac(glob_, os.path.join(a.out, "control"), a.control_steps, a.warmup_frac, 0, a.n_envs,
-                     a.device, a.max_fraction, a.buffer, min(a.eval_races, 30), a.decision_every)
+                     a.device, a.max_fraction, a.buffer, min(a.eval_races, 30), a.decision_every,
+                     a.update_every, a.grad_steps)
         _, _, te = split_by_date(list_tapes(glob_))
         rows.append(dict(run="control", **score("do nothing", evaluate(noop_policy, te, cfg, env_cls=ContinuousAllocEnv))))
         rows.append(dict(run="control", **score("random (f=0.02)", evaluate(random_cont_policy(), te, cfg,
@@ -202,7 +205,7 @@ def main(argv=None):
         print(f"\n--- seed {sd}: {a.steps} steps, first {int(a.steps * a.warmup_frac)} on random strategies ---",
               flush=True)
         ck = run_sac(a.tapes, os.path.join(a.out, f"real_seed{sd}"), a.steps, a.warmup_frac, sd, a.n_envs, a.device,
-                     a.max_fraction, a.buffer, a.eval_races, a.decision_every)
+                     a.max_fraction, a.buffer, a.eval_races, a.decision_every, a.update_every, a.grad_steps)
         actors[sd] = test_block(f"seed {sd}", ck, te, cfg, a.device, rows)
         results[sd] = (rows[-2], rows[-1])
 
