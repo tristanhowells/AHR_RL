@@ -126,3 +126,24 @@ def test_p3b_forward(tmp_path):
     if rows:
         s = summary(pd.DataFrame(rows).assign(hit_tp=lambda d: d["hit_tp"].fillna(False).astype(bool)))
         assert s["attempts"] == len(rows)
+
+
+def test_seq_frames_no_lookahead(tmp_path):
+    from ahr_rl.seq_study import CHANNELS, tape_frames
+
+    t = make_synthetic_tape(5)
+    p1, p2 = str(tmp_path / "a.npz"), str(tmp_path / "b.npz")
+    t.save(p1)
+    rows = pd.DataFrame(dict(s=[400, 600], runner=[0, 1]))
+    X1, Y1 = tape_frames(p1, rows, 60.0, 2.0)
+    assert X1.shape == (2, 30, len(CHANNELS)) and np.isfinite(X1.astype(np.float32)).all()
+    # scramble everything after the decision step: frames must not change, targets should
+    s = 400
+    t.back_tick[s + 1:] = np.maximum(t.back_tick[s + 1:] - 3, 0)
+    t.lay_tick[s + 1:] = np.maximum(t.lay_tick[s + 1:] - 3, 0)
+    t.back_size[s + 1:] *= 3
+    keep = t.trade_step <= s
+    t.trade_vol = np.where(keep, t.trade_vol, t.trade_vol * 5).astype(np.float32)
+    t.save(p2)
+    X2, Y2 = tape_frames(p2, rows.iloc[:1], 60.0, 2.0)
+    assert np.array_equal(X1[:1], X2)
