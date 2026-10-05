@@ -178,3 +178,28 @@ def test_blackbox_explorer_and_cap():
     a[-1] = 1.0  # asks for the whole bank
     env.step(a)
     assert env.ex.turnover <= 0.02 * 500 + 1e-6
+
+
+def test_strategy_search_pieces(tmp_path):
+    from ahr_rl.strategy_search import (GLOBAL_IDX, RUNNER_IDX, _eval_race, make_policy, mutate, random_strategy,
+                                        env_config)
+
+    rng = np.random.default_rng(0)
+    s = random_strategy(rng)
+    assert np.isclose(np.linalg.norm(s["w"]), 1.0) and len(s["v"]) == len(GLOBAL_IDX)
+    m = mutate(s, rng, 0.5)
+    assert np.isclose(np.linalg.norm(m["w"]), 1.0) and 0.3 <= m["enter"] <= 5.0
+    t = make_synthetic_tape(7)
+    p = str(tmp_path / "20990101_syn_7.npz")
+    t.save(p)
+    stats = (np.zeros(len(RUNNER_IDX)), np.ones(len(RUNNER_IDX)), np.zeros(len(GLOBAL_IDX)), np.ones(len(GLOBAL_IDX)))
+    # an always-enter strategy trades; "None" is do-nothing and scores exactly 0
+    eager = dict(s, enter=-1e9, side="back", max_open=1)
+    out = _eval_race((p, [eager, None], stats, 1))
+    assert np.isfinite(out).all() and out[1] == 0.0
+    pol = make_policy(eager, *stats, env_config())
+    from ahr_rl.env import BetfairPreRaceEnv
+    env = BetfairPreRaceEnv([p], env_config())
+    obs, _ = env.reset(options={"tape": p})
+    a = pol(obs, env)
+    assert (a > 0).sum() == 1  # max_open = 1
