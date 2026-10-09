@@ -203,3 +203,29 @@ def test_strategy_search_pieces(tmp_path):
     obs, _ = env.reset(options={"tape": p})
     a = pol(obs, env)
     assert (a > 0).sum() == 1  # max_open = 1
+
+
+def test_day_study_signals_no_lookahead():
+    from ahr_rl.day_study import back_ret, lay_ret_liab, meeting_signals, stressed
+
+    assert np.isclose(back_ret(np.array([5.0]), np.array([1]), 0.1)[0], 3.6)
+    assert np.isclose(lay_ret_liab(np.array([1.05]), np.array([0]), 0.1)[0], 0.9 / 0.05)
+    assert lay_ret_liab(np.array([1.05]), np.array([1]), 0.1)[0] == -1.0
+    # lays at 1.05 that won 47 / 50 look profitable (+0.14 per $1 liability) on this sample,
+    # but not at the 95% upper bound of the win rate
+    won = np.r_[np.ones(47, int), np.zeros(3, int)]
+    obs = lay_ret_liab(np.full(50, 1.05), won, np.full(50, 0.1)).mean()
+    assert obs > 0 and stressed(np.full(50, 1.05), won, np.full(50, 0.1), "lay") < 0
+    rows = []
+    for k in range(4):  # one meeting, races in order; jockey "A" wins races 0 and 1 as an outsider
+        for i, (j, draw) in enumerate([("A", 1), ("B", 2), ("C", 3)]):
+            won = int(i == 0) if k < 2 else int(i == 1)
+            rows.append(dict(race=f"r{k}", day="20260101", venue="X", start_ms=k * 1000.0, won=won, p_bsp=1 / 3,
+                             rank=i + 1, draw_rel=i / 2, jockey=j, trainer=j))
+    d = meeting_signals(pd.DataFrame(rows))
+    ja = d[d["jockey"] == "A"].sort_values("order")
+    assert np.isnan(ja["sig_jockey"].iloc[0])  # first race: nothing known yet
+    assert np.isclose(ja["sig_jockey"].iloc[1], 2 / 3)  # only race 0 counts
+    assert np.isclose(ja["sig_jockey"].iloc[3], 2 / 3 + 2 / 3 - 1 / 3)  # races 0-2, not race 3 itself
+    assert d.loc[d["order"] <= 2, "sig_draw"].isna().all()  # needs two earlier races
+    assert (d.loc[(d["order"] == 3) & (d["draw_rel"] == 0), "sig_draw"] > 0).all()  # inside was winning
