@@ -10,8 +10,10 @@ never used as features; `is_winner` is kept separately for diagnostics only.
 """
 from dataclasses import dataclass, field
 import re
+import warnings
 
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 import pandas as pd
 
 from .ladder import price_to_tick
@@ -96,16 +98,17 @@ def _ffill(a):
 
 
 def _rolling(a, n, fn):
-    """Trailing-window reduction over axis 0 with window n (causal, nan-aware)."""
-    T = a.shape[0]
-    out = np.full_like(a, np.nan)
-    for t in range(T):
-        w = a[max(0, t - n + 1): t + 1]
-        with np.errstate(all="ignore"):
-            if np.all(np.isnan(w), axis=0).all():
-                continue
-            out[t] = fn(w, axis=0)
-    return out
+    """Trailing-window reduction over axis 0 with window n (causal, nan-aware).
+
+    A window with no data for a runner (e.g. no trade in the last ~60 s) gives
+    NaN; callers fall back to the running value. numpy's "All-NaN slice"
+    warning for that case is expected and silenced.
+    """
+    x = np.concatenate([np.full((n - 1,) + a.shape[1:], np.nan), a])
+    w = sliding_window_view(x, n, axis=0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        return fn(w, axis=-1)
 
 
 def _lag_ret(x, lag):

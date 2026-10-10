@@ -210,6 +210,17 @@ def test_no_lookahead_and_no_result_leak():
     np.testing.assert_array_equal(full.global_feats, alt.global_feats)
 
 
+def test_rolling_quiet_runner_no_warning():
+    import warnings
+    from single_runner.features import _rolling
+    a = np.full((60, 2), np.nan)
+    a[::3, 0] = np.arange(20.0)                         # runner 0 trades, runner 1 never does
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        out = _rolling(a, 45, np.nanmax)
+    assert out[59, 0] == 19.0 and np.isnan(out[:, 1]).all()
+
+
 def test_agent_checkpoint_roundtrip(tmp_path, env):
     from single_runner.sac import SACAgent, SACConfig
     agent = SACAgent(obs_dim(), 6, SACConfig(hidden=(32, 32), device="cpu"))
