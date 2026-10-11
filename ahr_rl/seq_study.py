@@ -41,6 +41,7 @@ from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 import pandas as pd
 
+from . import race_filter
 from .env import list_tapes, split_by_date
 from .ladder import PRICES
 from .pair_study import FEATURES, pair_pnl, race_t
@@ -253,6 +254,7 @@ def main(argv=None):
     ap.add_argument("--max-rows", type=int, default=500000, help="random subsample of decisions (memory)")
     ap.add_argument("--epochs", type=int, default=15)
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 2)
+    race_filter.add_args(ap)
     ap.add_argument("--device", default="cuda" if __import__("torch").cuda.is_available() else "cpu")
     a = ap.parse_args(argv)
     os.makedirs(a.out, exist_ok=True)
@@ -261,9 +263,10 @@ def main(argv=None):
     t0 = time.time()
 
     paths = list_tapes(a.tapes)
-    by_race = {os.path.basename(p).split(".npz")[0]: p for p in paths}
     _, va_p, te_p = split_by_date(paths)
-    hold_days = {os.path.basename(p)[:8] for p in va_p + te_p}
+    hold_days = {os.path.basename(p)[:8] for p in va_p + te_p}  # same days as the unfiltered run
+    paths = race_filter.filter_paths(paths, a)
+    by_race = {os.path.basename(p).split(".npz")[0]: p for p in paths}
     df = pd.read_parquet(a.pairs)
     df = df[df["race"].isin(by_race)].reset_index(drop=True)
     if len(df) > a.max_rows:

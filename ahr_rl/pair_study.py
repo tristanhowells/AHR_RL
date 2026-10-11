@@ -54,6 +54,7 @@ from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 import pandas as pd
 
+from . import race_filter
 from .env import list_tapes, split_by_date
 from .jump_study import _round_trip, _walk
 from .ladder import N_TICKS, PRICES
@@ -471,6 +472,8 @@ def main(argv=None):
     ap.add_argument("--tapes", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 2)
+    ap.add_argument("--cache", default=None, help="pairs.parquet to reuse / write (default: <out>/pairs.parquet)")
+    race_filter.add_args(ap)
     ap.add_argument("--max-races", type=int, default=100000)
     ap.add_argument("--every-s", type=float, default=10.0)
     ap.add_argument("--fill", default="through", choices=FILLS, help="hedge fill rule for sections C and D")
@@ -480,10 +483,12 @@ def main(argv=None):
     pd.set_option("display.max_columns", 40)
     pd.set_option("display.max_rows", 200)
     t0 = time.time()
-    cache = os.path.join(a.out, "pairs.parquet")
+    cache = a.cache or os.path.join(a.out, "pairs.parquet")
     paths = list_tapes(a.tapes)[: a.max_races]
     tr, va, te = split_by_date(paths)
-    hold_days = {os.path.basename(p)[:8] for p in va + te}
+    hold_days = {os.path.basename(p)[:8] for p in va + te}  # same days as the unfiltered run
+    paths = race_filter.filter_paths(paths, a)
+    keep = {os.path.basename(p).split(".npz")[0] for p in paths}
     df = pd.read_parquet(cache) if os.path.exists(cache) else None
     if df is not None and "lad_back_1_close" not in df.columns:
         print(f"{cache} predates the ladder variant: rebuilding")
@@ -501,6 +506,7 @@ def main(argv=None):
                     print(f"  {i + 1}/{len(paths)} races, {time.time() - t0:.0f}s", flush=True)
         df = pd.concat(parts, ignore_index=True)
         df.to_parquet(cache, index=False)
+    df = df[df["race"].isin(keep)].reset_index(drop=True)  # the race filter (a cache may hold more races)
     df["split"] = np.where(df["day"].isin(hold_days), "holdout", "train")
     train, hold = df[df["split"] == "train"].reset_index(drop=True), df[df["split"] == "holdout"].reset_index(drop=True)
     print(f"\n{len(df)} decisions (runner x 10s) from {df['race'].nunique()} races: "

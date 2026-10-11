@@ -46,6 +46,7 @@ from dataclasses import replace
 import numpy as np
 import pandas as pd
 
+from . import race_filter
 from .env import BACK, CLOSE, LAY, TAKE, BetfairPreRaceEnv, EnvConfig, encode_open, list_tapes, split_by_date
 from .features import R_MAX
 from .synthetic import write_synthetic
@@ -257,6 +258,7 @@ def main(argv=None):
     ap.add_argument("--control-only", action="store_true")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 2)
+    race_filter.add_args(ap)
     a = ap.parse_args(argv)
     os.makedirs(a.out, exist_ok=True)
     t0 = time.time()
@@ -278,7 +280,7 @@ def main(argv=None):
             results.append(search(sorted(syn), pool, a, rng, "control", log))
         if not a.control_only:
             log("\n=== 1. Real races ===")
-            results.append(search(list_tapes(a.tapes), pool, a, rng, "real", log))
+            results.append(search(race_filter.filter_paths(list_tapes(a.tapes), a, log), pool, a, rng, "real", log))
 
     res = pd.DataFrame(results)
     res.to_csv(os.path.join(a.out, "results.csv"), index=False)

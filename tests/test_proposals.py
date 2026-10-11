@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import pandas as pd
 
@@ -229,3 +230,22 @@ def test_day_study_signals_no_lookahead():
     assert np.isclose(ja["sig_jockey"].iloc[3], 2 / 3 + 2 / 3 - 1 / 3)  # races 0-2, not race 3 itself
     assert d.loc[d["order"] <= 2, "sig_draw"].isna().all()  # needs two earlier races
     assert (d.loc[(d["order"] == 3) & (d["draw_rel"] == 0), "sig_draw"] > 0).all()  # inside was winning
+
+
+def test_race_filter(tmp_path):
+    import argparse
+
+    from ahr_rl import race_filter
+
+    paths = [str(tmp_path / f"20260101_1200_{v}_1_{i}.npz") for i, v in enumerate(["Flemington", "Melton", "Kilmore"])]
+    csv = tmp_path / "races.csv"
+    pd.DataFrame(dict(race=[os.path.basename(p)[:-4] for p in paths], race_type=["Flat", "Harness", "Flat"],
+                      venue=["Flemington", "Melton", "Kilmore"])).to_csv(csv, index=False)
+    ap = argparse.ArgumentParser()
+    race_filter.add_args(ap)
+    a = ap.parse_args(["--race-type", "flat", "--races-csv", str(csv)])
+    assert race_filter.filter_paths(paths, a, log=lambda m: None) == [paths[0], paths[2]]
+    a = ap.parse_args(["--race-type", "flat", "--metro-only", "--races-csv", str(csv)])
+    assert race_filter.filter_paths(paths, a, log=lambda m: None) == [paths[0]]
+    assert race_filter.filter_paths(paths, ap.parse_args([])) == paths  # no filter: unchanged
+    assert race_filter.tag(a) == "_flat_metro"

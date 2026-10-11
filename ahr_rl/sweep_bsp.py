@@ -41,6 +41,7 @@ from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 import pandas as pd
 
+from . import race_filter
 from .env import list_tapes, split_by_date
 from .exchange import BACK, LAY, Exchange, ExchangeConfig
 from .ladder import N_TICKS, PRICES
@@ -182,6 +183,7 @@ def main(argv=None):
     ap.add_argument("--tapes", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 2)
+    race_filter.add_args(ap)
     ap.add_argument("--max-races", type=int, default=100000)
     ap.add_argument("--min-races", type=int, default=30)
     ap.add_argument("--fill-mode", default="realistic", choices=["realistic", "no_queue"])
@@ -192,7 +194,8 @@ def main(argv=None):
     t0 = time.time()
     paths = list_tapes(a.tapes)[: a.max_races]
     tr, va, te = split_by_date(paths)
-    hold_days = {os.path.basename(p)[:8] for p in va + te}
+    hold_days = {os.path.basename(p)[:8] for p in va + te}  # same days as the unfiltered run
+    paths = race_filter.filter_paths(paths, a)
     os.environ["OMP_NUM_THREADS"] = "1"
     rows = []
     with ProcessPoolExecutor(a.workers, mp_context=mp.get_context("spawn")) as pool:
