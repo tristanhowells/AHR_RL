@@ -85,7 +85,10 @@ def study_tape(path: str) -> list[dict]:
         rows.append(dict(race=race, day=race[:8], runner=e["runner"], step=e["step"], t_rel=e["t_rel"],
                          top3_live=e["top3"], top3_final=e["top3_final"],
                          # the event set P3b scored: final-volume top 3, not in the last 40s before the off
-                         in_p3b=bool(e["top3_final"] and e["step"] < end - int(40 / t.dt)), **res))
+                         in_p3b=bool(e["top3_final"] and e["step"] < end - int(40 / t.dt)),
+                         # liquidity a live bot can see at the event (information only, not part of the rule)
+                         best_usd=float(t.back_size[e["step"], e["runner"], 0] + t.lay_size[e["step"], e["runner"], 0]),
+                         mkt_matched_now=float(t.total_matched[e["step"]]), **res))
     return rows
 
 

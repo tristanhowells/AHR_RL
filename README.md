@@ -149,6 +149,7 @@ python -m ahr_rl.report --run runs/ppo_v2            # writes gate.json
 | `strategy_search.py` | Black box, part 2: random search + mutation over whole rule-based strategies, positive control, scored once on TEST with a latency stress |
 | `day_study.py` | Beyond green-before-the-off: in-play resting orders (low lays / drift backs) and what earlier races at a meeting reveal (barrier, jockey, trainer, favourites), bets to the result |
 | `race_filter.py` | Shared `--race-type {all,flat,harness}` / `--metro-only` filter (from catalogues, tape catalogue features or the race study's races.csv) used by P3b, P6, P7 and P9 |
+| `liquidity_study.py` | Liquidity: runner and race tradeability by liquidity, and whether P6's model or the P3c drift fade do better in liquid markets (reuses 2g / P6 / P3c / 2h outputs) |
 | `community.py` | The pre-off rules traders automate (WOM scalp, pressure scalp, gap fill, volume levels, spoofs, scratchings, arbitrage), tested honestly |
 | `jump_study.py` | After a sudden price jump, or once a price leaves its session WAP, does it keep going or come back, and can you trade it? |
 

@@ -249,3 +249,14 @@ def test_race_filter(tmp_path):
     assert race_filter.filter_paths(paths, a, log=lambda m: None) == [paths[0]]
     assert race_filter.filter_paths(paths, ap.parse_args([])) == paths  # no filter: unchanged
     assert race_filter.tag(a) == "_flat_metro"
+
+
+def test_liquidity_quintiles_use_train_cutoffs():
+    from ahr_rl.liquidity_study import Q_LABELS, quintiles
+
+    x = pd.Series(np.r_[np.arange(100.0), np.arange(1000.0, 1100.0)])
+    train = np.r_[np.ones(100, bool), np.zeros(100, bool)]
+    q = quintiles(x, train)
+    # cut-offs come from the first 100 (train) values only: every later, larger value is in the top quintile
+    assert list(q.cat.categories) == Q_LABELS
+    assert (q[100:] == "Q5 deep").all() and (q[:100].value_counts() == 20).all()
