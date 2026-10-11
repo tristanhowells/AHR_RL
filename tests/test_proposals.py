@@ -327,3 +327,46 @@ def test_rebalance_signals(tmp_path):
     d["y"] = d["x"] * 2
     r = race_ic(d, "x", "y")
     assert np.isclose(r["ic"], 1.0) and r["races"] == 3
+
+
+def test_runner_agents():
+    import torch
+    from ahr_rl.continuous import act_mask_t, obs_t
+    from ahr_rl.features import N_RUNNER_FEATURES, R_MAX
+    from ahr_rl.runner_agents import (N_ACT, RunnerActor, RunnerAgentConfig, RunnerAgentEnv, RunnerCritic,
+                                      flat_action)
+
+    t = make_synthetic_tape(6)
+    t.back_size[:, 1:, 0] = t.lay_size[:, 1:, 0] = 1.0  # only runner 0 is above the gate
+    t.back_size[:, 0, 0] = t.lay_size[:, 0, 0] = 30.0
+    cfg = RunnerAgentConfig(min_best_usd=20.0, random_start_s=0.0, order_cap=20.0, runner_cap=30.0, market_cap=150.0)
+    env = RunnerAgentEnv([t], cfg)
+    o, _ = env.reset(options={"tape": t})
+    assert env.action_space.shape == (N_ACT * R_MAX,)
+    a = np.zeros(N_ACT * R_MAX, np.float32)
+    a[:6], a[R_MAX:R_MAX + 6] = 1.0, 1.0  # back every runner at full size
+    for _ in range(4):
+        env.step(a)
+    assert {f.runner for f in env.ex.fills} == {0}  # only the online runner trades
+    loss0 = -min(env.ex.W[0], env.ex.L[0])
+    assert loss0 <= 30.0 + 1e-6  # the runner cap holds over repeated adds
+    # reduce-only exit on a runner below the gate, capped at flat
+    env.ex.W[3], env.ex.L[3] = -40.0, 10.0  # pretend we laid runner 3
+    n0 = len(env.ex.fills)
+    a[:] = 0
+    a[3], a[R_MAX + 3] = 1.0, 1.0  # back it: reduces
+    env.step(a)
+    assert any(f.runner == 3 for f in env.ex.fills[n0:])  # the exit is allowed below the gate
+    assert env.ex.W[3] - env.ex.L[3] <= 1e-6  # never past flat
+    # networks: per-runner outputs, masked to online runners, critic per runner
+    o = env._obs()
+    F = o["runners"].shape[1]
+    actor, critic = RunnerActor(16, 1, F - N_RUNNER_FEATURES), RunnerCritic(16, 1, F - N_RUNNER_FEATURES)
+    r, g, m = (x[None] for x in obs_t(o, "cpu"))
+    am = act_mask_t(o, "cpu")[None]
+    _, act, lp = actor.sample(r, g, m, am)
+    assert act.shape == (1, R_MAX, N_ACT) and lp.shape == (1, R_MAX)
+    assert (act[0, ~am[0].bool()] == 0).all() and (act[0, :, 1] >= 0).all()
+    assert critic(r, g, m, act).shape == (1, R_MAX)
+    fa = flat_action(act[0].detach().numpy())
+    assert fa.shape == (N_ACT * R_MAX,) and np.allclose(fa[:R_MAX], act[0, :, 0].detach().numpy())

@@ -181,7 +181,10 @@ def _episode_stats(info, sink):
 
 def _maybe_eval(args, actor, cfg, va, it, best, logf, stats, t0, steps, device):
     val = {"mean_green_$": np.nan, "pct_green": np.nan, "mean_trades": np.nan, "mean_turnover_$": np.nan}
-    if it % args.eval_every == 0:
+    # SAC: no checkpoints during the random warm-up. The untrained actor's deterministic action is "no bet"
+    # ($0 on VAL), so a warm-up checkpoint would otherwise win "best" whenever every trained one loses.
+    learning = args.algo != "sac" or steps >= args.warmup
+    if it % args.eval_every == 0 and learning:
         actor.eval()
         val = summarise(evaluate(make_policy_fn(actor, device), va[: args.eval_races], cfg,
                                  env_cls=ContinuousAllocEnv))
@@ -366,6 +369,10 @@ def train_sac(args):
                             pt.mul_(1 - args.tau).add_(args.tau * p)
         _maybe_eval(args, actor, cfg, va, it, best, logf, stats, t0, steps, device)
     venv.close()
+    if not os.path.exists(os.path.join(args.out, "best.pt")):  # run too short for a learning-phase checkpoint
+        ck = {"actor": actor.state_dict(), "cfg": asdict(cfg), "args": vars(args), "iter": n_iters, "val": None}
+        torch.save(ck, os.path.join(args.out, "best.pt"))
+        torch.save(ck, os.path.join(args.out, "last.pt"))
 
 
 # ============================================================================ PPO

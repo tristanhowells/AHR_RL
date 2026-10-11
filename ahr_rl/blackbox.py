@@ -138,10 +138,9 @@ def score(name: str, df: pd.DataFrame) -> dict:
                 worst_race=float(live["worst"].min()) if len(live) else np.nan)
 
 
-def forensics(actor, tapes, cfg, device) -> pd.DataFrame:
+def forensics(pol, tapes, cfg, env_cls=ContinuousAllocEnv) -> pd.DataFrame:
     """What the agent trades: every fill by side, favourite rank and time to the start."""
-    env = ContinuousAllocEnv(tapes, cfg, cache_tapes=False)
-    pol = make_policy_fn(actor, device)
+    env = env_cls(tapes, cfg, cache_tapes=False)
     rows = []
     for tp in tapes:
         obs, _ = env.reset(options={"tape": tp})
@@ -174,7 +173,8 @@ def run_sac(tapes_glob, out, steps, warmup_frac, seed, n_envs, device, max_fract
             "--max-fraction", str(max_fraction), "--decision-every", str(decision_every),
             "--min-best-usd", str(min_best_usd), "--buffer", str(buffer),
             "--update-every", str(update_every), "--grad-steps", str(grad_steps),
-            "--eval-races", str(eval_races), "--eval-every", str(max(1, steps // n_envs // 10))]  # ~10 checkpoints
+            "--eval-races", str(eval_races),
+            "--eval-every", str(max(1, int(steps * (1 - warmup_frac)) // n_envs // 10))]  # ~10 after the warm-up
     if not gate_inputs:
         argv.append("--no-gate-inputs")
     train_sac(sac_args(argv))
@@ -182,13 +182,24 @@ def run_sac(tapes_glob, out, steps, warmup_frac, seed, n_envs, device, max_fract
 
 
 def test_block(label, ckpt, test, cfg, device, rows, stress=True):
+    """Scores the VAL-picked checkpoint (and its latency stress); returns (actor, agent row, stress row).
+    The last checkpoint is scored too, for information only: it shows what training ended with even when
+    nothing beat doing nothing on VAL."""
     actor = load_actor(ckpt, device)
     pol = make_policy_fn(actor, device)
-    rows.append(dict(run=label, **score("agent", evaluate(pol, test, cfg, env_cls=ContinuousAllocEnv))))
+    main = dict(run=label, **score("agent", evaluate(pol, test, cfg, env_cls=ContinuousAllocEnv)))
+    rows.append(main)
+    slow_row = None
     if stress:
         slow = replace(cfg, exchange=replace(cfg.exchange, latency_steps=2))
-        rows.append(dict(run=label, **score("agent, 1s latency", evaluate(pol, test, slow, env_cls=ContinuousAllocEnv))))
-    return actor
+        slow_row = dict(run=label, **score("agent, 1s latency", evaluate(pol, test, slow, env_cls=ContinuousAllocEnv)))
+        rows.append(slow_row)
+    last = os.path.join(os.path.dirname(ckpt), "last.pt")
+    if os.path.exists(last):
+        lp = make_policy_fn(load_actor(last, device), device)
+        rows.append(dict(run=label, **score("last checkpoint (info)", evaluate(lp, test, cfg,
+                                                                             env_cls=ContinuousAllocEnv))))
+    return actor, main, slow_row
 
 
 def main(argv=None):
@@ -258,8 +269,7 @@ def main(argv=None):
         rows.append(dict(run="control", **score("do nothing", evaluate(noop_policy, cte, cfg, env_cls=ContinuousAllocEnv))))
         rows.append(dict(run="control", **score("random (f=0.02)", evaluate(random_cont_policy(), cte, cfg,
                                                                               env_cls=ContinuousAllocEnv))))
-        test_block("control", ck, cte, cfg, a.device, rows, stress=False)
-        ctl = rows[-1]
+        _, ctl, _ = test_block("control", ck, cte, cfg, a.device, rows, stress=False)
         control_ok = bool(ctl["mean_green"] > 0 and (ctl["t"] or 0) > 2)
         print(pd.DataFrame([r for r in rows if r["run"] == "control"]).round(3).to_string(index=False))
         print("control: the black box FINDS a small planted edge" if control_ok else
@@ -284,8 +294,8 @@ def main(argv=None):
         ck = run_sac(a.tapes, os.path.join(a.out, f"real_seed{sd}"), a.steps, a.warmup_frac, sd, a.n_envs, a.device,
                      a.max_fraction, a.buffer, a.eval_races, a.decision_every, a.update_every, a.grad_steps, cut,
                      not a.no_gate_inputs)
-        actors[sd] = test_block(f"seed {sd}", ck, te, cfg, a.device, rows)
-        results[sd] = (rows[-2], rows[-1])
+        actors[sd], main_row, slow_row = test_block(f"seed {sd}", ck, te, cfg, a.device, rows)
+        results[sd] = (main_row, slow_row)
 
     res = pd.DataFrame(rows)
     res.to_csv(os.path.join(a.out, "results.csv"), index=False)
@@ -295,7 +305,7 @@ def main(argv=None):
     # ---------------- forensics on the best seed
     best_sd = max(results, key=lambda s: results[s][0]["mean_green"]) if results else None
     if best_sd is not None:
-        fz = forensics(actors[best_sd], te[:100], cfg, a.device)
+        fz = forensics(make_policy_fn(actors[best_sd], a.device), te[:100], cfg)
         fz.to_csv(os.path.join(a.out, f"fills_seed{best_sd}.csv"), index=False)
         print(f"\n=== What seed {best_sd} trades on TEST races ({len(fz)} fills) ===")
         if len(fz):

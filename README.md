@@ -146,6 +146,7 @@ python -m ahr_rl.report --run runs/ppo_v2            # writes gate.json
 | `pair_study.py` | A paired action spec (back pair / lay pair / nothing, each bet with its own resting green-up hedge): what each action is worth, the oracle headroom, and whether a model can pick the good pairs |
 | `seq_study.py` | Frame stacking: a 1D CNN on raw stacked frames vs boosted trees on hand-made features, same decisions and holdout days as P6 |
 | `blackbox.py` | Black box: SAC with a long random-strategy warm-up, a planted-edge positive control, multi-seed TEST evaluation with a latency stress; `--min-best-usd` gates opening positions to runners with enough money at the best prices (P13) |
+| `runner_agents.py` | P13c: per-runner agents. One shared SAC policy, a copy per runner above the liquidity cut (2 actions each, its own P&L as reward, per-runner and per-market loss caps), same control / VAL / TEST pipeline as P13 |
 | `strategy_search.py` | Black box, part 2: random search + mutation over whole rule-based strategies, positive control, scored once on TEST with a latency stress |
 | `day_study.py` | Beyond green-before-the-off: in-play resting orders (low lays / drift backs) and what earlier races at a meeting reveal (barrier, jockey, trainer, favourites), bets to the result |
 | `race_filter.py` | Shared `--race-type {all,flat,harness}` / `--metro-only` filter (from catalogues, tape catalogue features or the race study's races.csv) used by P3b, P6, P7 and P9 |
