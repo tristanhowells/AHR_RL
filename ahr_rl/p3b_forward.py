@@ -24,6 +24,16 @@ Pre-registered decision (forward days only, i.e. day >= --since):
                                                if t >= 2, else FAIL
 Re-running this every few days is fine: the rule and the thresholds never change.
 
+AMENDMENT (2026-10-11, made before any forward day had been scored): the decision is
+taken on THOROUGHBRED (Flat) races only. The race study (2h) found harness markets
+untradeable before the off, and the thoroughbred-only re-run of P3b (cell R) scored
+this exact rule at t 2.1 on train days and t 2.0 on holdout days (56 races), against
+t 1.0 on train days when harness races were pooled in. The rule's parameters, the
+thresholds and the forward start date are unchanged. All races are still reported,
+for information only. Race type comes from the catalogues (--catalogues), the tape's
+catalogue features, or the race study's races.csv; races whose type can't be
+resolved are left out of the decision.
+
     python -m ahr_rl.p3b_forward --tapes "data/tapes/*.npz" --out runs/p3b_forward
 """
 from __future__ import annotations
@@ -38,6 +48,7 @@ from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 import pandas as pd
 
+from . import race_filter
 from .env import list_tapes, split_by_date
 from .exchange import BACK
 from .sweep_bsp import _race_t, run_trade
@@ -48,8 +59,10 @@ FROZEN = dict(J=5, dir="drift", W=30, tp=3, hold="start", runners="top3", exit="
               frozen_on="20261005")
 SINCE = "20261005"  # first day the P3b run never saw
 MIN_ATTEMPTS, MIN_RACES, MAX_ATTEMPTS = 300, 100, 600
-# P3b holdout (look-ahead top 3), for comparison
+# P3b holdout (look-ahead top 3), for comparison: all races (P3b) and thoroughbreds only (cell R)
 P3B_HOLDOUT = dict(ev_per_attempt=0.0102, t=2.15, races=178, fill_pct=70.9)
+P3B_HOLDOUT_FLAT = dict(ev_per_attempt=0.0113, t=2.01, races=56, train_ev=0.0056, train_t=2.10)
+DECIDE_ON = "flat"  # amendment of 2026-10-11
 
 
 def study_tape(path: str) -> list[dict]:
@@ -140,6 +153,8 @@ def main(argv=None):
     ap.add_argument("--out", required=True)
     ap.add_argument("--since", default=SINCE, help="first forward day (YYYYMMDD); keep the default")
     ap.add_argument("--workers", type=int, default=os.cpu_count() or 2)
+    race_filter.add_args(ap)
+    ap.set_defaults(race_type=DECIDE_ON)
     a = ap.parse_args(argv)
     os.makedirs(a.out, exist_ok=True)
     pd.set_option("display.width", 250)
@@ -163,6 +178,20 @@ def main(argv=None):
     df["hit_tp"] = df["hit_tp"].fillna(False).astype(bool)
     df.to_parquet(os.path.join(a.out, "attempts.parquet"), index=False)
     df["forward"] = df["day"] >= a.since
+    info = race_filter.race_info(paths, a.catalogues, a.races_csv).set_index("race")
+    df["race_type"] = df["race"].map(info["race_type"]).fillna("Unknown")
+    df["metro"] = df["race"].map(info["metro"]).fillna(False).astype(bool)
+    dec = np.ones(len(df), bool)
+    if a.race_type != "all":
+        dec &= (df["race_type"].str.lower() == a.race_type).to_numpy()
+    if a.metro_only:
+        dec &= df["metro"].to_numpy()
+    df["decide"] = dec
+    label = a.race_type + (" metro" if a.metro_only else "")
+    n_unknown = info.loc[info.index.isin(df["race"]), "race_type"].eq("Unknown").sum()
+    print(f"decision set: {label} races ({df.loc[dec, 'race'].nunique()} of {df['race'].nunique()} races with "
+          f"events); race type unknown for {n_unknown} races (left out of the decision)"
+          + (" -> pass --catalogues so new races are typed" if n_unknown else ""))
 
     # ---------------- 1. old days: does removing the look-ahead change the result?
     h = df[~df["forward"]]
@@ -170,25 +199,33 @@ def main(argv=None):
     hold_days = {os.path.basename(p)[:8] for p in va + te}
     print("\n=== 1. Days P3b already used: the rule with P3b's look-ahead top 3 vs the live top 3 ===")
     rows_s = []
-    for name, sel in (("P3b events (top 3 at the off)", h["in_p3b"]), ("live (top 3 so far)", h["top3_live"])):
-        for split in ("train", "holdout"):
-            m = sel & (h["day"].isin(hold_days) if split == "holdout" else ~h["day"].isin(hold_days))
-            rows_s.append(dict(definition=name, split=split, **summary(h[m])))
+    for races_name, rsel in ((label, h["decide"]), ("all", np.ones(len(h), bool))):
+        for name, sel in (("P3b events (top 3 at the off)", h["in_p3b"]), ("live (top 3 so far)", h["top3_live"])):
+            for split in ("train", "holdout"):
+                m = rsel & sel & (h["day"].isin(hold_days) if split == "holdout" else ~h["day"].isin(hold_days))
+                rows_s.append(dict(race_set=races_name, definition=name, split=split, **summary(h[m])))
     old_tab = pd.DataFrame(rows_s)
     print(old_tab.round(4).to_string(index=False))
-    print(f"(P3b reported holdout: {P3B_HOLDOUT['ev_per_attempt'] * 100:+.2f}% per attempt, t {P3B_HOLDOUT['t']:.2f}, "
-          f"{P3B_HOLDOUT['races']} races; small differences come from the 40s-before-the-off events)")
+    print(f"(P3b reported holdout: all races {P3B_HOLDOUT['ev_per_attempt'] * 100:+.2f}% per attempt, t "
+          f"{P3B_HOLDOUT['t']:.2f}, {P3B_HOLDOUT['races']} races; thoroughbreds {P3B_HOLDOUT_FLAT['ev_per_attempt'] * 100:+.2f}%,"
+          f" t {P3B_HOLDOUT_FLAT['t']:.2f}, {P3B_HOLDOUT_FLAT['races']} races. Small differences come from the "
+          f"40s-before-the-off events.)")
+    old_tab.to_csv(os.path.join(a.out, "old_days.csv"), index=False)
 
     # ---------------- 2. forward days: the test
-    fwd = df[df["forward"] & df["top3_live"]]
+    fwd_all = df[df["forward"] & df["top3_live"]]
+    fwd = fwd_all[fwd_all["decide"]]
     s = summary(fwd)
     status = decide(s)
-    print(f"\n=== 2. FORWARD TEST: days >= {a.since}, live top 3 ===")
+    print(f"\n=== 2. FORWARD TEST: days >= {a.since}, live top 3, {label} races (the decision) ===")
     if len(fwd):
         print(f"{fwd['day'].min()} .. {fwd['day'].max()}, {fwd['day'].nunique()} days")
         by_day = fwd.groupby("day").apply(lambda g: pd.Series(summary(g)), include_groups=False)
         print(by_day[["attempts", "races", "fill_pct", "tp_pct", "ev_per_attempt"]].round(4).to_string())
     print("\noverall: " + ", ".join(f"{k} {v:.4f}" if isinstance(v, float) else f"{k} {v}" for k, v in s.items()))
+    s_all = summary(fwd_all)
+    print("all races (information only, not the decision): "
+          + ", ".join(f"{k} {v:.4f}" if isinstance(v, float) else f"{k} {v}" for k, v in s_all.items()))
     plot(fwd, os.path.join(a.out, "forward_cumulative.png"))
 
     # pace: how many more days until the first decision
@@ -197,7 +234,9 @@ def main(argv=None):
         per_day = len(fwd) / fwd["day"].nunique()
         left = max(MIN_ATTEMPTS - len(fwd), 0)
         need = f" (~{left / max(per_day, 1e-9):.0f} more recording days at {per_day:.0f} attempts/day)" if left else ""
-    verdict = dict(rule=FROZEN, since=a.since, forward=s, status=status,
+    verdict = dict(rule=FROZEN, since=a.since, decision_races=label, forward=s, forward_all_races=s_all,
+                   status=status, amendment="2026-10-11: decide on thoroughbred races only (before any forward day "
+                                            "was scored); rule and thresholds unchanged",
                    decision_rule=f">= {MIN_ATTEMPTS} attempts & {MIN_RACES} races: mean <= 0 FAIL; t >= 2 PASS; "
                                  f"else continue to {MAX_ATTEMPTS}, then PASS only if t >= 2")
     json.dump(verdict, open(os.path.join(a.out, "forward_status.json"), "w"), indent=1, default=float)
