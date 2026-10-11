@@ -34,6 +34,15 @@ for information only. Race type comes from the catalogues (--catalogues), the ta
 catalogue features, or the race study's races.csv; races whose type can't be
 resolved are left out of the decision.
 
+ARM B, "deep markets" (registered 2026-10-11, scored only from 2026-10-12 so no day it
+counts has been seen): the same frozen rule, thoroughbreds only, and only drifts where
+the market had matched >= $5,000 so far at the moment of the event (the train-day 80th
+percentile of P3c attempts, $5,024, rounded down; a live bot sees it). P11 found the
+fade stronger there on old days (top liquidity fifth: train +1.08% t 2.1, holdout
++2.03% t 1.8), found by slicing, hence its own forward test. Same thresholds and
+decision rule as the main arm, decided separately. Expect about half the attempts of
+the main arm, so roughly twice as long to a decision.
+
     python -m ahr_rl.p3b_forward --tapes "data/tapes/*.npz" --out runs/p3b_forward
 """
 from __future__ import annotations
@@ -63,6 +72,7 @@ MIN_ATTEMPTS, MIN_RACES, MAX_ATTEMPTS = 300, 100, 600
 P3B_HOLDOUT = dict(ev_per_attempt=0.0102, t=2.15, races=178, fill_pct=70.9)
 P3B_HOLDOUT_FLAT = dict(ev_per_attempt=0.0113, t=2.01, races=56, train_ev=0.0056, train_t=2.10)
 DECIDE_ON = "flat"  # amendment of 2026-10-11
+DEEP_ARM = dict(race_type="flat", min_mkt_matched=5000.0, since="20261012", registered="20261011")
 
 
 def study_tape(path: str) -> list[dict]:
@@ -231,6 +241,19 @@ def main(argv=None):
           + ", ".join(f"{k} {v:.4f}" if isinstance(v, float) else f"{k} {v}" for k, v in s_all.items()))
     plot(fwd, os.path.join(a.out, "forward_cumulative.png"))
 
+    # ---------------- arm B: deep markets
+    s_deep, status_deep = None, None
+    if "mkt_matched_now" in fwd_all:
+        deep = df[(df["day"] >= DEEP_ARM["since"]) & df["top3_live"] &
+                  (df["race_type"].str.lower() == DEEP_ARM["race_type"]) &
+                  (df["mkt_matched_now"] >= DEEP_ARM["min_mkt_matched"])]
+        s_deep = summary(deep)
+        status_deep = decide(s_deep)
+        print(f"\n=== ARM B (deep markets): days >= {DEEP_ARM['since']}, thoroughbreds, market matched so far >= "
+              f"${DEEP_ARM['min_mkt_matched']:,.0f} ===")
+        print(", ".join(f"{k} {v:.4f}" if isinstance(v, float) else f"{k} {v}" for k, v in s_deep.items()))
+        print(f"ARM B STATUS: {status_deep}")
+
     # pace: how many more days until the first decision
     need = ""
     if status == "CONTINUE" and len(fwd):
@@ -241,7 +264,8 @@ def main(argv=None):
                    status=status, amendment="2026-10-11: decide on thoroughbred races only (before any forward day "
                                             "was scored); rule and thresholds unchanged",
                    decision_rule=f">= {MIN_ATTEMPTS} attempts & {MIN_RACES} races: mean <= 0 FAIL; t >= 2 PASS; "
-                                 f"else continue to {MAX_ATTEMPTS}, then PASS only if t >= 2")
+                                 f"else continue to {MAX_ATTEMPTS}, then PASS only if t >= 2",
+                   arm_b=dict(definition=DEEP_ARM, forward=s_deep, status=status_deep))
     json.dump(verdict, open(os.path.join(a.out, "forward_status.json"), "w"), indent=1, default=float)
     print(f"\n=== STATUS: {status}{need} ===")
     print({"CONTINUE": "keep recording; re-run this cell every few days. Do not change the rule.",
