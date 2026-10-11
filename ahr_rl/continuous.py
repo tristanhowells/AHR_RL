@@ -96,10 +96,11 @@ class Actor(nn.Module):
         lp = lp - (2 * (math.log(2) - u - Fn.softplus(-2 * u)))  # tanh Jacobian
         return (lp * dmask).sum(-1)
 
-    def sample(self, runners, glob, mask, deterministic=False):
+    def sample(self, runners, glob, mask, deterministic=False, act_mask=None):
+        """``mask``: runners the agent sees; ``act_mask``: runners it may act on (default: all it sees)."""
         mu, log_std = self(runners, glob, mask)
         u = mu if deterministic else mu + log_std.exp() * torch.randn_like(mu)
-        dm = self.dim_mask(mask)
+        dm = self.dim_mask(mask if act_mask is None else act_mask)
         return u, self.squash(u) * dm, self.log_prob(mu, log_std, u, dm), mu, log_std
 
 
@@ -137,11 +138,16 @@ def obs_t(o, device):
             torch.as_tensor(o["mask"], dtype=torch.float32, device=device))
 
 
+def act_mask_t(o, device):
+    return torch.as_tensor(o.get("act_mask", o["mask"]), dtype=torch.float32, device=device)
+
+
 def make_policy_fn(actor, device="cpu"):
     @torch.no_grad()
     def f(obs, env):
         r, g, m = obs_t(obs, device)
-        _, a, _, _, _ = actor.sample(r[None], g[None], m[None], deterministic=True)
+        am = act_mask_t(obs, device)
+        _, a, _, _, _ = actor.sample(r[None], g[None], m[None], deterministic=True, act_mask=am[None])
         return a[0].cpu().numpy()
 
     return f
@@ -154,7 +160,8 @@ def _setup(args):
     tr, va, te = split_by_date(list_tapes(args.tapes))
     json.dump({"train": tr, "val": va, "test": te}, open(os.path.join(args.out, "split.json"), "w"), indent=1)
     cfg = ContinuousConfig(random_start_s=30.0, max_fraction=getattr(args, "max_fraction", 1.0),
-                           decision_every=getattr(args, "decision_every", 4))
+                           decision_every=getattr(args, "decision_every", 4),
+                           min_best_usd=getattr(args, "min_best_usd", 0.0))
     json.dump({**vars(args), "env": asdict(cfg)}, open(os.path.join(args.out, "config.json"), "w"), indent=1,
               default=str)
     fns = [(lambda i=i: ContinuousAllocEnv(tr, cfg, seed=args.seed + i)) for i in range(args.n_envs)]
@@ -246,7 +253,7 @@ class RandomStrategies:
                 # small wager fraction: uniform f would bet half the bank every 2s
                 act[i, :R_MAX] = self.rng.uniform(-1, 1, R_MAX)
                 act[i, -1] = self.rng.uniform(0, 1) ** 3 * self.fmax
-        act[:, :R_MAX] *= obs["mask"]
+        act[:, :R_MAX] *= obs.get("act_mask", obs["mask"])
         return act
 
 
@@ -272,12 +279,14 @@ def train_sac(args):
     B_r = np.zeros((C, R, F), np.float16)
     B_g = np.zeros((C, G), np.float32)
     B_m = np.zeros((C, R), np.bool_)
+    B_am = np.zeros((C, R), np.bool_)
     B_a = np.zeros((C, N_CONT), np.float32)
     B_rew = np.zeros(C, np.float32)
     B_d = np.zeros(C, np.float32)
     B_r2 = np.zeros((C, R, F), np.float16)
     B_g2 = np.zeros((C, G), np.float32)
     B_m2 = np.zeros((C, R), np.bool_)
+    B_am2 = np.zeros((C, R), np.bool_)
     ptr, full = 0, False
     rms = RunningMeanStd()
     logf = open(os.path.join(args.out, "train_log.csv"), "w")
@@ -290,14 +299,15 @@ def train_sac(args):
             act = explorer.act(obs)
         else:
             with torch.no_grad():
-                _, a, _, _, _ = actor.sample(*obs_t(obs, device))
+                _, a, _, _, _ = actor.sample(*obs_t(obs, device), act_mask=act_mask_t(obs, device))
             act = a.cpu().numpy()
         nobs, rew, term, trunc, info = venv.step(act)
         _episode_stats(info, stats)
         done = np.logical_or(term, trunc)
         explorer.episode_done(done)
         # SAME_STEP autoreset: the true next obs of finished envs is in final_obs
-        nxt = {k: nobs[k].copy() for k in ("runners", "global", "mask")}
+        keys = [k for k in ("runners", "global", "mask", "act_mask") if k in nobs]
+        nxt = {k: nobs[k].copy() for k in keys}
         if "final_obs" in info:
             for i in np.nonzero(info["_final_obs"])[0]:
                 for k in nxt:
@@ -307,6 +317,8 @@ def train_sac(args):
             B_r[ptr], B_g[ptr], B_m[ptr] = obs["runners"][i], obs["global"][i], obs["mask"][i]
             B_a[ptr], B_rew[ptr], B_d[ptr] = act[i], rew[i], float(term[i])
             B_r2[ptr], B_g2[ptr], B_m2[ptr] = nxt["runners"][i], nxt["global"][i], nxt["mask"][i]
+            B_am[ptr] = obs.get("act_mask", obs["mask"])[i]
+            B_am2[ptr] = nxt.get("act_mask", nxt["mask"])[i]
             ptr = (ptr + 1) % C
             full = full or ptr == 0
         obs = nobs
@@ -318,11 +330,12 @@ def train_sac(args):
                 t = lambda x, dt=torch.float32: torch.as_tensor(x[idx], dtype=dt, device=device)
                 r, g, m, a = t(B_r), t(B_g), t(B_m), t(B_a)
                 r2, g2, m2 = t(B_r2), t(B_g2), t(B_m2)
+                am, am2 = t(B_am), t(B_am2)
                 rw = t(B_rew) / math.sqrt(rms.var + 1e-8)
                 d = t(B_d)
                 alpha = log_alpha.exp().detach()
                 with torch.no_grad():
-                    _, a2, lp2, _, _ = actor.sample(r2, g2, m2)
+                    _, a2, lp2, _, _ = actor.sample(r2, g2, m2, act_mask=am2)
                     qt = torch.min(q1t(r2, g2, m2, a2), q2t(r2, g2, m2, a2)) - alpha * lp2
                     y = rw + args.gamma * (1 - d) * qt
                 ql = Fn.mse_loss(q1(r, g, m, a), y) + Fn.mse_loss(q2(r, g, m, a), y)
@@ -330,7 +343,7 @@ def train_sac(args):
                 ql.backward()
                 nn.utils.clip_grad_norm_(list(q1.parameters()) + list(q2.parameters()), 10.0)
                 q_opt.step()
-                _, an, lp, _, _ = actor.sample(r, g, m)
+                _, an, lp, _, _ = actor.sample(r, g, m, act_mask=am)
                 qn = torch.min(q1(r, g, m, an), q2(r, g, m, an))
                 al = (alpha * lp - qn).mean()
                 a_opt.zero_grad()
@@ -338,7 +351,7 @@ def train_sac(args):
                 nn.utils.clip_grad_norm_(actor.parameters(), 10.0)
                 a_opt.step()
                 # target entropy scales with the number of active action dims
-                tgt = -args.target_entropy_per_dim * (m.sum(-1) + 1)
+                tgt = -args.target_entropy_per_dim * (am.sum(-1) + 1)
                 alpha_loss = -(log_alpha * (lp.detach() + tgt)).mean()
                 al_opt.zero_grad()
                 alpha_loss.backward()
@@ -447,6 +460,8 @@ def parse_args(argv=None):
                     help="random exploration before learning starts (see RandomStrategies)")
     ap.add_argument("--max-fraction", type=float, default=1.0, help="cap on the share of funds wagered per step")
     ap.add_argument("--decision-every", type=int, default=4, help="tape steps (0.5s) per decision")
+    ap.add_argument("--min-best-usd", type=float, default=0.0,
+                    help="liquidity gate: open runners only with >= this $ at best back + lay (0 = off)")
     ap.add_argument("--update-every", type=int, default=1)
     ap.add_argument("--grad-steps", type=int, default=1)
     ap.add_argument("--tau", type=float, default=0.005)

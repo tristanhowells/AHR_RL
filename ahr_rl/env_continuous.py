@@ -18,6 +18,14 @@ same tapes, matching engine, funds check, commission, auto-green safety net
 from the scheduled start, and reward (change in mark-to-market green value).
 Note there is no explicit exit/hedge action here: to green up the agent must
 itself place the offsetting bets.
+
+Liquidity gate (``min_best_usd`` > 0): a runner may only be *opened* while the money
+at its best back + lay prices, averaged over the last ``liq_window_s`` (live, no
+look-ahead), is at least ``min_best_usd``. A runner below the gate that the agent
+already holds may still be traded, but only to reduce that position (capped at the
+stake that flattens it). The observation gains ``act_mask``: the runners the agent
+can act on (tradeable or held). ``mask`` is unchanged, so the agent still sees the
+whole market.
 """
 from __future__ import annotations
 
@@ -40,6 +48,8 @@ class ContinuousConfig(EnvConfig):
     min_fraction: float = 0.01  # f below this -> no bets this step
     temperature: float = 0.25  # softmax temperature over |a_r|
     max_fraction: float = 1.0  # cap on f (share of available funds wagered per step)
+    min_best_usd: float = 0.0  # liquidity gate ($ at best back + lay); 0 = off
+    liq_window_s: float = 10.0  # trailing window the gate averages over
 
 
 class ContinuousAllocEnv(BetfairPreRaceEnv):
@@ -48,6 +58,33 @@ class ContinuousAllocEnv(BetfairPreRaceEnv):
         lo = np.full(N_CONT, -1.0, np.float32)
         lo[-1] = 0.0
         self.action_space = gym.spaces.Box(lo, np.ones(N_CONT, np.float32), dtype=np.float32)
+        self.observation_space = gym.spaces.Dict({**self.observation_space.spaces,
+                                                  "act_mask": gym.spaces.MultiBinary(R_MAX)})
+
+    def liquid(self, step: int | None = None) -> np.ndarray:
+        """Runners (n_runners,) passing the liquidity gate at ``step`` (all True if the gate is off)."""
+        t, R = self.tape, self.tape.n_runners
+        if self.cfg.min_best_usd <= 0:
+            return np.ones(R, bool)
+        s = self.ex.step if step is None else step
+        k = max(1, int(round(self.cfg.liq_window_s / t.dt)))
+        lo = max(0, s - k + 1)
+        best = t.back_size[lo:s + 1, :, 0].astype(np.float64) + t.lay_size[lo:s + 1, :, 0]
+        return best.mean(0) >= self.cfg.min_best_usd
+
+    def held(self) -> np.ndarray:
+        return np.abs(self.ex.W - self.ex.L) > 1e-6
+
+    def _obs(self):
+        o = super()._obs()
+        am = o["mask"].copy()
+        if self.cfg.min_best_usd > 0:
+            n = min(self.tape.n_runners, R_MAX)
+            ok = np.zeros(R_MAX, bool)
+            ok[:n] = (self.liquid() | self.held())[:n]
+            am &= ok.astype(am.dtype)
+        o["act_mask"] = am
+        return o
 
     def _apply(self, action):
         ex, cfg = self.ex, self.cfg
@@ -57,10 +94,14 @@ class ContinuousAllocEnv(BetfairPreRaceEnv):
         if f < cfg.min_fraction:
             return
         R = min(self.tape.n_runners, R_MAX)
+        liq = self.liquid()
+        expo = ex.W - ex.L  # > 0 long (backed), < 0 short (laid)
         elig = []
         for r in range(R):
             if abs(a[r]) < cfg.deadzone or not self.tape.active[ex.step, r] or ex.void_runner[r]:
                 continue
+            if not liq[r] and not ((a[r] > 0 and expo[r] < -1e-6) or (a[r] < 0 and expo[r] > 1e-6)):
+                continue  # below the gate: only trades that reduce a held position
             bb, bl = ex.best(ex.step, r)
             if (a[r] > 0 and bb >= 0) or (a[r] < 0 and bl >= 0):
                 elig.append(r)
@@ -74,8 +115,14 @@ class ContinuousAllocEnv(BetfairPreRaceEnv):
             amt = budget * wr
             bb, bl = ex.best(ex.step, r)
             if a[r] > 0:
-                o = ex.submit(r, BACK, bb, amt)
+                stake = amt
             else:
-                o = ex.submit(r, LAY, bl, amt / max(PRICES[bl] - 1.0, 0.01))
+                stake = amt / max(PRICES[bl] - 1.0, 0.01)
+            if not liq[r]:  # reduce only: never past flat
+                hp = ex.hedge_plan(r)
+                if hp is None:
+                    continue
+                stake = min(stake, hp[2])
+            o = ex.submit(r, BACK if a[r] > 0 else LAY, bb if a[r] > 0 else bl, stake)
             if o is not None:
                 self.n_opens += 1

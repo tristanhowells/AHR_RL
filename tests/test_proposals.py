@@ -181,6 +181,35 @@ def test_blackbox_explorer_and_cap():
     assert env.ex.turnover <= 0.02 * 500 + 1e-6
 
 
+def test_liquidity_gate():
+    from ahr_rl.blackbox import best_usd_trailing
+    from ahr_rl.env_continuous import N_CONT, ContinuousAllocEnv, ContinuousConfig
+
+    t = make_synthetic_tape(6)
+    t.back_size[:, 1:, 0] = 1.0  # runners 1.. are thin, runner 0 keeps its synthetic depth (~$40 a side)
+    t.lay_size[:, 1:, 0] = 1.0
+    t.back_size[:, 0, 0] = t.lay_size[:, 0, 0] = 30.0
+    cfg = ContinuousConfig(min_best_usd=20.0, max_fraction=0.05, random_start_s=0.0)
+    env = ContinuousAllocEnv([t], cfg)
+    o, _ = env.reset(options={"tape": t})
+    assert o["act_mask"][0] == 1 and o["act_mask"][1:6].sum() == 0 and o["mask"][:6].sum() == 6  # sees all
+    a = np.zeros(N_CONT, np.float32)
+    a[:6], a[-1] = 1.0, 0.05  # back everything
+    env.step(a)
+    assert {f.runner for f in env.ex.fills} <= {0}  # thin runners cannot be opened
+    # a held runner that falls below the gate stays actionable, but only to reduce
+    env.ex.W[2], env.ex.L[2] = 5.0, 0.0  # pretend we are long runner 2
+    o = env._obs()
+    assert o["act_mask"][2] == 1
+    n0 = len(env.ex.fills)
+    a[:] = 0
+    a[2], a[-1] = 1.0, 0.05  # back more: not allowed
+    env.step(a)
+    assert all(f.runner != 2 for f in env.ex.fills[n0:])
+    # the trailing mean is live: no future rows
+    b = best_usd_trailing(t, 10.0)
+    assert np.isclose(b[0, 0], 60.0) and np.isclose(b[5, 1], 2.0)
+
 def test_strategy_search_pieces(tmp_path):
     from ahr_rl.strategy_search import (GLOBAL_IDX, RUNNER_IDX, _eval_race, make_policy, mutate, random_strategy,
                                         env_config)
