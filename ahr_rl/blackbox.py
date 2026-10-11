@@ -116,7 +116,7 @@ def gate_summary(paths, cut: float, window_s: float = 10.0) -> dict:
 def load_actor(path: str, device: str):
     ck = torch.load(path, map_location=device, weights_only=False)
     ar = ck["args"]
-    actor = Actor(ar["d_model"], ar["n_layers"]).to(device)
+    actor = Actor(ar["d_model"], ar["n_layers"], runner_extra=ar.get("runner_extra", 0)).to(device)
     actor.load_state_dict(ck["actor"])
     actor.eval()
     return actor
@@ -167,7 +167,7 @@ def forensics(actor, tapes, cfg, device) -> pd.DataFrame:
 
 
 def run_sac(tapes_glob, out, steps, warmup_frac, seed, n_envs, device, max_fraction, buffer, eval_races,
-            decision_every, update_every=2, grad_steps=1, min_best_usd=0.0):
+            decision_every, update_every=2, grad_steps=1, min_best_usd=0.0, gate_inputs=True):
     argv = ["--algo", "sac", "--tapes", tapes_glob, "--out", out, "--total-steps", str(steps),
             "--n-envs", str(n_envs), "--seed", str(seed), "--device", device,
             "--warmup", str(int(steps * warmup_frac)), "--warmup-mode", "mixed",
@@ -175,6 +175,8 @@ def run_sac(tapes_glob, out, steps, warmup_frac, seed, n_envs, device, max_fract
             "--min-best-usd", str(min_best_usd), "--buffer", str(buffer),
             "--update-every", str(update_every), "--grad-steps", str(grad_steps),
             "--eval-races", str(eval_races), "--eval-every", str(max(1, steps // n_envs // 10))]  # ~10 checkpoints
+    if not gate_inputs:
+        argv.append("--no-gate-inputs")
     train_sac(sac_args(argv))
     return os.path.join(out, "best.pt")
 
@@ -202,6 +204,8 @@ def main(argv=None):
     ap.add_argument("--grad-steps", type=int, default=1, help="SAC: gradient steps per update round")
     ap.add_argument("--min-best-usd", default="0",
                     help='liquidity gate in $ at best back + lay; "auto" = P11 top quintile on TRAIN days; 0 = off')
+    ap.add_argument("--no-gate-inputs", action="store_true",
+                    help="gated, but without the per-runner (above cut, distance to cut) network inputs")
     ap.add_argument("--buffer", type=int, default=400_000)
     ap.add_argument("--control-steps", type=int, default=150_000)
     ap.add_argument("--control-races", type=int, default=200)
@@ -220,12 +224,13 @@ def main(argv=None):
     tr, _, te = split_by_date(tapes)
     cut = liquidity_cut(tr) if a.min_best_usd == "auto" else float(a.min_best_usd)
     cfg = ContinuousConfig(random_start_s=0.0, max_fraction=a.max_fraction, decision_every=a.decision_every,
-                           min_best_usd=cut)
+                           min_best_usd=cut, gate_inputs=not a.no_gate_inputs)
     gates = {}
     if cut > 0:
         gates["real_test"] = gate_summary(te, cut)
         print(f"=== Liquidity gate: open a runner only with >= ${cut:.2f} at best back + lay (10s mean)"
-              f"{' [auto: P11 top quintile, TRAIN days]' if a.min_best_usd == 'auto' else ''} ===")
+              f"{' [auto: P11 top quintile, TRAIN days]' if a.min_best_usd == 'auto' else ''}"
+              f"{'' if a.no_gate_inputs else '; networks get (above cut, distance to cut) per runner'} ===")
         g = gates["real_test"]
         print(f"TEST races, last 5 min: {g['runner_share_open'] * 100:.0f}% of runner snapshots pass; "
               f"{g['races_with_any_open']} of {g['races']} races have a tradeable runner at some point; "
@@ -249,7 +254,7 @@ def main(argv=None):
                   f"snapshots pass", flush=True)
         ck = run_sac(glob_, os.path.join(a.out, "control"), a.control_steps, a.warmup_frac, 0, a.n_envs,
                      a.device, a.max_fraction, a.buffer, min(a.eval_races, 30), a.decision_every,
-                     a.update_every, a.grad_steps, cut)
+                     a.update_every, a.grad_steps, cut, not a.no_gate_inputs)
         rows.append(dict(run="control", **score("do nothing", evaluate(noop_policy, cte, cfg, env_cls=ContinuousAllocEnv))))
         rows.append(dict(run="control", **score("random (f=0.02)", evaluate(random_cont_policy(), cte, cfg,
                                                                               env_cls=ContinuousAllocEnv))))
@@ -277,7 +282,8 @@ def main(argv=None):
         print(f"\n--- seed {sd}: {a.steps} steps, first {int(a.steps * a.warmup_frac)} on random strategies ---",
               flush=True)
         ck = run_sac(a.tapes, os.path.join(a.out, f"real_seed{sd}"), a.steps, a.warmup_frac, sd, a.n_envs, a.device,
-                     a.max_fraction, a.buffer, a.eval_races, a.decision_every, a.update_every, a.grad_steps, cut)
+                     a.max_fraction, a.buffer, a.eval_races, a.decision_every, a.update_every, a.grad_steps, cut,
+                     not a.no_gate_inputs)
         actors[sd] = test_block(f"seed {sd}", ck, te, cfg, a.device, rows)
         results[sd] = (rows[-2], rows[-1])
 

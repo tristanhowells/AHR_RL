@@ -184,6 +184,7 @@ def test_blackbox_explorer_and_cap():
 def test_liquidity_gate():
     from ahr_rl.blackbox import best_usd_trailing
     from ahr_rl.env_continuous import N_CONT, ContinuousAllocEnv, ContinuousConfig
+    from ahr_rl.features import R_MAX
 
     t = make_synthetic_tape(6)
     t.back_size[:, 1:, 0] = 1.0  # runners 1.. are thin, runner 0 keeps its synthetic depth (~$40 a side)
@@ -206,6 +207,24 @@ def test_liquidity_gate():
     a[2], a[-1] = 1.0, 0.05  # back more: not allowed
     env.step(a)
     assert all(f.runner != 2 for f in env.ex.fills[n0:])
+    # the networks get (above cut, distance to cut) per runner; off-gate it is unchanged
+    from ahr_rl.features import N_RUNNER_FEATURES
+    assert o["runners"].shape[1] == N_RUNNER_FEATURES + 2
+    assert o["runners"][0, -2] == 1 and o["runners"][1, -2] == 0 and o["runners"][2, -2] == 0  # held != above cut
+    assert np.isclose(o["runners"][0, -1], np.log(60 / 20) / 3) and np.isclose(o["runners"][1, -1], np.log(2 / 20) / 3)
+    assert (o["runners"][6:, -2:] == 0).all()  # empty slots
+    o2, _ = ContinuousAllocEnv([t], ContinuousConfig()).reset(options={"tape": t})
+    assert o2["runners"].shape[1] == N_RUNNER_FEATURES
+    o3, _ = ContinuousAllocEnv([t], ContinuousConfig(min_best_usd=20.0, gate_inputs=False)).reset(options={"tape": t})
+    assert o3["runners"].shape[1] == N_RUNNER_FEATURES
+    # actor and critic accept the wider input
+    import torch
+    from ahr_rl.continuous import Actor, Critic, act_mask_t, obs_t
+    actor, critic = Actor(16, 1, runner_extra=2), Critic(16, 1, runner_extra=2)
+    r, g, m = (x[None] for x in obs_t(o, "cpu"))
+    _, act, _, _, _ = actor.sample(r, g, m, act_mask=act_mask_t(o, "cpu")[None])
+    assert act.shape == (1, N_CONT) and (act[0, 6:R_MAX] == 0).all() and act[0, 1] == 0 and act[0, 3:6].abs().sum() == 0
+    assert critic(r, g, m, act).shape == (1,)
     # the trailing mean is live: no future rows
     b = best_usd_trailing(t, 10.0)
     assert np.isclose(b[0, 0], 60.0) and np.isclose(b[5, 1], 2.0)

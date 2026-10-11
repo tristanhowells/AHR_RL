@@ -59,9 +59,10 @@ class Backbone(nn.Module):
 class Actor(nn.Module):
     """Squashed Gaussian over 24 runner actions (tanh) + fraction ((tanh+1)/2)."""
 
-    def __init__(self, d=64, layers=2, frac_bias=-2.5, init_log_std=-0.5):
+    def __init__(self, d=64, layers=2, frac_bias=-2.5, init_log_std=-0.5, runner_extra=0):
+        """runner_extra: extra columns appended to each runner's features (e.g. the liquidity-gate inputs)."""
         super().__init__()
-        self.bb = Backbone(d, layers)
+        self.bb = Backbone(d, layers, runner_extra=runner_extra)
         self.r_head = nn.Linear(d, 2)
         self.f_head = nn.Linear(2 * d, 2)
         with torch.no_grad():
@@ -107,9 +108,9 @@ class Actor(nn.Module):
 class Critic(nn.Module):
     """Q(s, a): each runner token sees its own action; the market token sees f."""
 
-    def __init__(self, d=64, layers=2):
+    def __init__(self, d=64, layers=2, runner_extra=0):
         super().__init__()
-        self.bb = Backbone(d, layers, runner_extra=1, global_extra=1)
+        self.bb = Backbone(d, layers, runner_extra=1 + runner_extra, global_extra=1)
         self.out = nn.Sequential(nn.Linear(2 * d, d), nn.GELU(), nn.Linear(d, 1))
 
     def forward(self, runners, glob, mask, act):
@@ -161,7 +162,8 @@ def _setup(args):
     json.dump({"train": tr, "val": va, "test": te}, open(os.path.join(args.out, "split.json"), "w"), indent=1)
     cfg = ContinuousConfig(random_start_s=30.0, max_fraction=getattr(args, "max_fraction", 1.0),
                            decision_every=getattr(args, "decision_every", 4),
-                           min_best_usd=getattr(args, "min_best_usd", 0.0))
+                           min_best_usd=getattr(args, "min_best_usd", 0.0),
+                           gate_inputs=not getattr(args, "no_gate_inputs", False))
     json.dump({**vars(args), "env": asdict(cfg)}, open(os.path.join(args.out, "config.json"), "w"), indent=1,
               default=str)
     fns = [(lambda i=i: ContinuousAllocEnv(tr, cfg, seed=args.seed + i)) for i in range(args.n_envs)]
@@ -260,9 +262,11 @@ class RandomStrategies:
 def train_sac(args):
     cfg, venv, va = _setup(args)
     device = torch.device(args.device)
-    actor = Actor(args.d_model, args.n_layers).to(device)
-    q1, q2 = Critic(args.d_model, args.n_layers).to(device), Critic(args.d_model, args.n_layers).to(device)
-    q1t, q2t = Critic(args.d_model, args.n_layers).to(device), Critic(args.d_model, args.n_layers).to(device)
+    # runner features beyond the standard set (the liquidity-gate inputs when gated); saved in the checkpoint args
+    args.runner_extra = int(venv.single_observation_space["runners"].shape[1]) - N_RUNNER_FEATURES
+    actor = Actor(args.d_model, args.n_layers, runner_extra=args.runner_extra).to(device)
+    q1, q2 = (Critic(args.d_model, args.n_layers, args.runner_extra).to(device) for _ in range(2))
+    q1t, q2t = (Critic(args.d_model, args.n_layers, args.runner_extra).to(device) for _ in range(2))
     q1t.load_state_dict(q1.state_dict())
     q2t.load_state_dict(q2.state_dict())
     for p in list(q1t.parameters()) + list(q2t.parameters()):
@@ -462,6 +466,8 @@ def parse_args(argv=None):
     ap.add_argument("--decision-every", type=int, default=4, help="tape steps (0.5s) per decision")
     ap.add_argument("--min-best-usd", type=float, default=0.0,
                     help="liquidity gate: open runners only with >= this $ at best back + lay (0 = off)")
+    ap.add_argument("--no-gate-inputs", action="store_true",
+                    help="gated, but don't give the networks the per-runner (above cut, distance to cut) inputs")
     ap.add_argument("--update-every", type=int, default=1)
     ap.add_argument("--grad-steps", type=int, default=1)
     ap.add_argument("--tau", type=float, default=0.005)
