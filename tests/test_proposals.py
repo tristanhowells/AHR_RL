@@ -260,3 +260,22 @@ def test_liquidity_quintiles_use_train_cutoffs():
     # cut-offs come from the first 100 (train) values only: every later, larger value is in the top quintile
     assert list(q.cat.categories) == Q_LABELS
     assert (q[100:] == "Q5 deep").all() and (q[:100].value_counts() == 20).all()
+
+
+def test_rebalance_signals(tmp_path):
+    from ahr_rl.rebalance_study import race_ic, sample_tape
+
+    t = make_synthetic_tape(8)
+    p = str(tmp_path / "20260101_0000_Test_1_9.npz")
+    t.save(p)
+    df, ll = sample_tape(p)
+    assert df is not None and len(df) and ll is not None
+    # the signals only use the past: sig_lag = -(others' change) x share - own change, own change = mom
+    w = 15
+    row = df.dropna(subset=[f"sig_lag_{w}"]).iloc[0]
+    assert np.isfinite(row[f"mom_{w}"])
+    # a perfectly informative signal has IC 1 in every race
+    d = pd.DataFrame(dict(race=np.repeat(["a", "b", "c"], 10), x=np.tile(np.arange(10.0), 3)))
+    d["y"] = d["x"] * 2
+    r = race_ic(d, "x", "y")
+    assert np.isclose(r["ic"], 1.0) and r["races"] == 3
