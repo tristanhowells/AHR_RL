@@ -1,0 +1,8 @@
+{"market_id": "1.262901771", "catalogue": {"marketId": "1.262901771", "marketName": "R8 2240m Pace M",
+ "description": {"marketBaseRate": 8.0, "raceType": "Harness", "marketType": "WIN"},
+ "runners": [
+  {"selectionId": 102840360, "runnerName": "1. Soho Trump", "sortPriority": 1,
+   "metadata": {"FORM": "x1191", "STALL_DRAW": "1", "DAYS_SINCE_LAST_RUN": "8", "AGE": "3", "SEX_TYPE": "C", "WEIGHT_VALUE": null}},
+  {"selectionId": 95263970, "runnerName": "2. Atua Magic", "sortPriority": 2,
+   "metadata": {"FORM": "3x124", "STALL_DRAW": "2", "DAYS_SINCE_LAST_RUN": "9", "AGE": "3", "SEX_TYPE": "C", "WEIGHT_VALUE": null}}
+ ]}}

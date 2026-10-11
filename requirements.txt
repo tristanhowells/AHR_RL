@@ -1,0 +1,11 @@
+numpy>=1.26
+pandas>=2.0
+pyarrow
+torch>=2.2
+gymnasium>=1.0
+orjson
+pytest
+# live trading only
+betfairlightweight>=2.20
+scikit-learn
+scipy
