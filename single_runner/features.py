@@ -1,312 +1,257 @@
-"""Race loading + causal feature engineering for the single-runner environment.
+"""Causal per-runner + global features computed from a stream tape (ahr_rl.tape.Tape).
 
-A race parquet (schema 1.3.x, one row per ~1.3 s stream snapshot, columns
-`run[i].*` per runner) is turned into dense numpy arrays once, so the
-environment's step() is just array indexing.
-
-Every feature at row t uses only rows <= t (cumulative / trailing-window ops),
-so there is no look-ahead. Result columns (`run[i].is_winner`, `result_*`) are
-never used as features; `is_winner` is kept separately for diagnostics only.
+A tape is the pre-race market on a fixed 0.5 s grid: 8-level atb/atl ladders,
+every trade (runner, tick, single-counted volume), projected BSP, scratchings
+and, optionally, catalogue form features. All features are computed once per
+tape for every grid step; row s uses only ladder rows <= s and trades in steps
+<= s, so there is no look-ahead. Settlement fields (winner, bsp) are never used.
 """
-from dataclasses import dataclass, field
-import re
+from dataclasses import dataclass
 import warnings
 
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
-import pandas as pd
 
-from .ladder import price_to_tick
+from ahr_rl.catalogue import N_STATIC
+from ahr_rl.ladder import PRICES
 
 MAX_RUNNERS = 24
-LEVELS = 3
-ROLL_STEPS = 45          # ~60 s at the 1.33 s capture interval
-RET_LAGS = (1, 5, 20, 60)
+RET_LAGS_S = (5, 15, 30, 60, 120, 300)
+WIN_S = 60.0          # rolling VWAP / matched-range window
+FLOW_S = 30.0         # trade-flow window
+RECENT_S = 5.0        # "volume just now" window
 
 RUNNER_FEATURES = (
-    [f"log_back_p{k}" for k in range(1, LEVELS + 1)]
-    + [f"log_lay_p{k}" for k in range(1, LEVELS + 1)]
-    + [f"log1p_back_s{k}" for k in range(1, LEVELS + 1)]
-    + [f"log1p_lay_s{k}" for k in range(1, LEVELS + 1)]
-    + ["has_back", "has_lay", "log_ltp", "log_micro", "prob_implied", "fair_prob",
-       "rel_spread", "spread_ticks", "ob_imbalance", "wom_l1", "wom_3l",
-       "book_wap_rel", "vwap_rel", "vwap_roll_rel",
-       "max_matched_rel", "min_matched_rel", "max_matched_roll_rel", "min_matched_roll_rel",
-       "log1p_tv", "log1p_tv_60s", "log1p_dvol", "vol_share", "log1p_secs_since_trade",
-       "ret_std_5s", "ret_std_20s"]
-    + [f"ret_{l}" for l in RET_LAGS]
-    + ["ltp_rel", "rank_norm", "is_fav", "active"]
+    [f"log_back_p{k}" for k in (1, 2, 3)] + [f"log_lay_p{k}" for k in (1, 2, 3)]
+    + [f"log1p_back_s{k}" for k in (1, 2, 3)] + [f"log1p_lay_s{k}" for k in (1, 2, 3)]
+    + ["has_back", "has_lay", "log1p_back_depth", "log1p_lay_depth",
+       "log_ltp", "log_fair", "fair_prob", "spread_ticks",
+       "wom_l1", "wom_l3", "wom_all", "book_wap_rel",
+       "vwap_rel", "vwap_win_rel", "max_matched_rel", "min_matched_rel",
+       "max_matched_win_rel", "min_matched_win_rel",
+       "log1p_tv", "log1p_vol_win", "log1p_vol_recent", "flow_imbalance", "vol_share",
+       "log1p_secs_since_trade"]
+    + [f"ret_{l}s" for l in RET_LAGS_S]
+    + ["ltp_rel", "spn_rel", "has_spn", "rank_norm", "is_fav", "active"]
+    + [f"static_{i}" for i in range(N_STATIC)]
 )
 N_RUNNER_FEATURES = len(RUNNER_FEATURES)
 
 GLOBAL_FEATURES = [
-    "secs_to_off", "log1p_total_matched", "dlog_total_matched", "back_overround",
-    "lay_overround", "overround_gap", "prob_entropy", "fav_prob_gap",
-    "spread_mean_run", "spread_std_run", "runner_count", "n_active", "commission",
-    "is_flat", "is_harness", "is_other_code", "distance", "dt",
+    "t_rel", "log1p_total_matched", "dlog_total_matched_30s", "back_overround", "lay_overround",
+    "prob_entropy", "fav_prob_gap", "mean_spread_ticks", "n_active", "runner_count",
+    "commission", "suspended", "has_static",
 ]
 N_GLOBAL_FEATURES = len(GLOBAL_FEATURES)
 
-_RUN_RE = re.compile(r"run\[(\d+)\]\.")
-
 
 @dataclass
-class RaceData:
-    path: str
-    market_id: str
-    race_date: str
-    commission: float
-    n_runners: int
-    T: int                       # decision steps (pre-race OPEN rows)
-    in_play_found: bool
-    # raw book used by the matching engine, shape [T, R] (NaN = no offer)
-    back_p: np.ndarray           # [T, R, 3] best available-to-BACK prices (desc)
-    back_s: np.ndarray           # [T, R, 3]
-    lay_p: np.ndarray            # [T, R, 3] best available-to-LAY prices (asc)
-    lay_s: np.ndarray            # [T, R, 3]
-    ltp: np.ndarray              # [T, R]
-    tv: np.ndarray               # [T, R] cumulative traded volume
-    fair: np.ndarray             # [T, R] fair price (microprice -> mid -> ltp)
-    rank: np.ndarray             # [T, R] 1 = favourite, inactive = R+1
-    active: np.ndarray           # [T, R] bool
-    ts: np.ndarray               # [T] seconds
-    runner_feats: np.ndarray     # [T, R, N_RUNNER_FEATURES] float32
-    global_feats: np.ndarray     # [T, N_GLOBAL_FEATURES] float32
-    is_winner: np.ndarray = field(default=None)   # [R] diagnostics only
-
-
-def _col(df, name, default=np.nan):
-    if name in df.columns:
-        return pd.to_numeric(df[name], errors="coerce").to_numpy(dtype=np.float64)
-    return np.full(len(df), default, dtype=np.float64)
-
-
-def _runner_count(df):
-    idx = {int(m.group(1)) for c in df.columns if (m := _RUN_RE.match(c))}
-    return (max(idx) + 1) if idx else 0
+class TapeFeatures:
+    runner: np.ndarray    # [T, R, N_RUNNER_FEATURES] float32
+    glob: np.ndarray      # [T, N_GLOBAL_FEATURES] float32
+    fair: np.ndarray      # [T, R] fair price (probability-space microprice), 0 = none
+    rank: np.ndarray      # [T, R] 1 = favourite, R + 1 = inactive / no price
+    priced: np.ndarray    # [T, R] bool: active with at least one price
 
 
 def _ffill(a):
-    """Forward-fill NaNs along axis 0 (causal)."""
-    a = a.copy()
-    mask = np.isnan(a)
-    idx = np.where(~mask, np.arange(a.shape[0])[:, None], 0)
+    """Forward-fill NaN along axis 0."""
+    idx = np.where(~np.isnan(a), np.arange(a.shape[0])[:, None], 0)
     np.maximum.accumulate(idx, axis=0, out=idx)
     out = a[idx, np.arange(a.shape[1])[None, :]]
-    out[np.cumsum(~mask, axis=0) == 0] = np.nan
     return out
 
 
-def _rolling(a, n, fn):
-    """Trailing-window reduction over axis 0 with window n (causal, nan-aware).
-
-    A window with no data for a runner (e.g. no trade in the last ~60 s) gives
-    NaN; callers fall back to the running value. numpy's "All-NaN slice"
-    warning for that case is expected and silenced.
-    """
+def _window_reduce(a, n, fn):
+    """Trailing window of n rows over axis 0; all-NaN windows give NaN (silently)."""
     x = np.concatenate([np.full((n - 1,) + a.shape[1:], np.nan), a])
-    w = sliding_window_view(x, n, axis=0)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
-        return fn(w, axis=-1)
+        return fn(sliding_window_view(x, n, axis=0), axis=-1)
 
 
-def _lag_ret(x, lag):
-    out = np.zeros_like(x)
-    if x.shape[0] > lag:
-        with np.errstate(all="ignore"):
-            out[lag:] = np.log(x[lag:] / x[:-lag])
+def _window_sum(cum, n):
+    """Trailing n-row sum from a cumulative array."""
+    out = cum.copy()
+    out[n:] -= cum[:-n]
     return out
 
 
-def find_decision_rows(df):
-    """Rows the agent acts on: pre-race, market OPEN. Returns (rows, in_play_found)."""
-    in_play = _col(df, "in_play", 0.0)
-    status = df["market_status"].astype(str).to_numpy() if "market_status" in df.columns \
-        else np.array(["OPEN"] * len(df))
-    ip = np.where(in_play > 0.5)[0]
-    end = int(ip[0]) if len(ip) else len(df)
-    rows = np.array([i for i in range(end) if status[i] == "OPEN"], dtype=np.int64)
-    return rows, bool(len(ip))
+def fair_price(bt, bs, lt, ls):
+    """Probability-space microprice from level 1. Inputs [..]; returns price, 0 = no book.
 
-
-def load_race(path, max_runners=MAX_RUNNERS):
-    df = pd.read_parquet(path)
-    return build_race(df, path=str(path), max_runners=max_runners)
-
-
-def build_race(df, path="<df>", max_runners=MAX_RUNNERS):
-    rows, in_play_found = find_decision_rows(df)
-    d = df.iloc[rows].reset_index(drop=True)
-    T = len(d)
-    R = min(_runner_count(df), max_runners)
-    if T == 0 or R == 0:
-        raise ValueError(f"{path}: no pre-race OPEN rows or no runners")
-
-    def rc(i, name, default=np.nan):
-        return _col(d, f"run[{i}].{name}", default)
-
-    def stack(name, default=np.nan):
-        return np.stack([rc(i, name, default) for i in range(R)], axis=1)
-
-    back_p = np.stack([stack(f"back_price_{k}") for k in range(1, LEVELS + 1)], axis=2)
-    back_s = np.stack([stack(f"back_size_{k}") for k in range(1, LEVELS + 1)], axis=2)
-    lay_p = np.stack([stack(f"lay_price_{k}") for k in range(1, LEVELS + 1)], axis=2)
-    lay_s = np.stack([stack(f"lay_size_{k}") for k in range(1, LEVELS + 1)], axis=2)
-    # a size without a price (or vice versa) is no offer
-    back_s = np.where(np.isnan(back_p), 0.0, np.nan_to_num(back_s))
-    lay_s = np.where(np.isnan(lay_p), 0.0, np.nan_to_num(lay_s))
-
-    ltp_raw = stack("last_traded_price")
-    tv = np.nan_to_num(_ffill(stack("traded_vol_total")), nan=0.0)
-    micro = stack("microprice")
-    has_back = ~np.isnan(back_p[..., 0])
-    has_lay = ~np.isnan(lay_p[..., 0])
+    Backing at the atb price p_b buys the outcome at probability 1/p_b; laying at
+    the atl price p_l sells it at 1/p_l. Weighting each by the size on the other
+    side gives the microprice in probability, which is what the green value is
+    linear in.
+    """
+    has_b, has_l = bt >= 0, lt >= 0
+    pb = np.where(has_b, PRICES[np.clip(bt, 0, None)], np.nan)
+    pl = np.where(has_l, PRICES[np.clip(lt, 0, None)], np.nan)
     with np.errstate(all="ignore"):
-        mid = np.where(has_back & has_lay, 0.5 * (back_p[..., 0] + lay_p[..., 0]), np.nan)
-    ltp = _ffill(ltp_raw)
-    fair = micro.copy()
-    for alt in (mid, ltp, back_p[..., 0], lay_p[..., 0]):
-        fair = np.where(np.isnan(fair), alt, fair)
-    fair = np.clip(fair, 1.01, 1000.0)
-    active = has_back | has_lay
-    fair_f = np.where(active, fair, np.nan)
-    fair_filled = np.nan_to_num(fair_f, nan=1000.0)
-    ltp = np.where(np.isnan(ltp), fair_filled, ltp)
+        w = bs + ls
+        prob = np.where(w > 0, (ls / pb + bs / pl) / w, np.nan)
+        prob = np.where(has_b & has_l, prob, np.where(has_b, 1 / pb, np.where(has_l, 1 / pl, np.nan)))
+        return np.nan_to_num(1.0 / prob, nan=0.0)
 
-    # favouritism rank (1 = shortest price) among active runners
-    order = np.argsort(np.where(active, fair_filled, np.inf), axis=1, kind="stable")
+
+def build_features(tape, commission):
+    T, R = tape.n_steps, tape.n_runners
+    dt = float(tape.dt)
+    steps = lambda s: max(1, int(round(s / dt)))
+    bt, bs = tape.back_tick.astype(np.int64), tape.back_size.astype(np.float64)
+    lt, ls = tape.lay_tick.astype(np.int64), tape.lay_size.astype(np.float64)
+    bs = np.where(bt >= 0, bs, 0.0)
+    ls = np.where(lt >= 0, ls, 0.0)
+    has_b, has_l = bt[..., 0] >= 0, lt[..., 0] >= 0
+    priced = tape.active & (has_b | has_l)
+
+    ltp_tick = tape.ltp_tick.astype(np.int64)
+    ltp_p = np.where(ltp_tick >= 0, PRICES[np.clip(ltp_tick, 0, None)], np.nan)
+    fair = fair_price(bt[..., 0], bs[..., 0], lt[..., 0], ls[..., 0])
+    fair = np.where(fair > 0, fair, np.nan_to_num(ltp_p, nan=0.0))
+    fair = np.where(priced, fair, 0.0)
+    fair_f = np.where(fair > 0, fair, np.nan)
+    fair_ff = _ffill(fair_f)                                 # for lagged returns
+    ref = np.where(fair > 0, fair, 1000.0)                   # denominator for *_rel features
+
+    order = np.argsort(np.where(priced, ref, np.inf), axis=1, kind="stable")
     rank = np.empty_like(order)
     rank[np.arange(T)[:, None], order] = np.arange(1, R + 1)[None, :]
-    rank = np.where(active, rank, R + 1)
+    rank = np.where(priced, rank, R + 1)
 
-    # ---------------- engineered features (all causal) ----------------
-    eps = 1e-9
-    prob_implied = np.nan_to_num(stack("prob_implied"), nan=0.0)
-    prob_from_fair = np.where(active, 1.0 / fair_filled, 0.0)
-    prob_implied = np.where(prob_implied > 0, prob_implied, prob_from_fair)
-    fair_prob = prob_from_fair / np.maximum(prob_from_fair.sum(1, keepdims=True), eps)
-
-    sb, sl = back_s.sum(2), lay_s.sum(2)
-    wom_3l = np.where(sb + sl > 0, sb / np.maximum(sb + sl, eps), 0.5)
-    wom_l1 = np.where(back_s[..., 0] + lay_s[..., 0] > 0,
-                      back_s[..., 0] / np.maximum(back_s[..., 0] + lay_s[..., 0], eps), 0.5)
-    pw = np.nan_to_num(back_p) * back_s + np.nan_to_num(lay_p) * lay_s
-    book_wap = np.where(sb + sl > 0, pw.sum(2) / np.maximum(sb + sl, eps), fair_filled)
-
-    dvol = np.zeros_like(tv)
-    dvol[1:] = np.maximum(tv[1:] - tv[:-1], 0.0)
-    traded = dvol > 0
-    ltp_tr = np.where(traded, ltp, np.nan)
-    cum_v = np.cumsum(dvol, 0)
-    cum_pv = np.cumsum(np.where(traded, dvol * ltp, 0.0), 0)
-    vwap = np.where(cum_v > 0, cum_pv / np.maximum(cum_v, eps), fair_filled)
-    k = ROLL_STEPS
-    roll_v = cum_v - np.vstack([np.zeros((k, R)), cum_v[:-k]])[:T]
-    roll_pv = cum_pv - np.vstack([np.zeros((k, R)), cum_pv[:-k]])[:T]
-    vwap_roll = np.where(roll_v > 0, roll_pv / np.maximum(roll_v, eps), fair_filled)
-    # max/min matched price: running + trailing window (ltp of the first row seeds it)
-    seed = np.where(np.isnan(ltp_tr), np.nan, ltp_tr)
-    seed[0] = np.where(np.isnan(seed[0]), ltp[0], seed[0])
+    # ---- trades -> per-step per-runner arrays (exact prices, single-counted volume)
+    vol = np.zeros((T, R))
+    pv = np.zeros((T, R))
+    bvol = np.zeros((T, R))       # backers taking atl (trade at/above previous best lay)
+    lvol = np.zeros((T, R))       # layers taking atb (trade at/below previous best back)
+    hi = np.full((T, R), np.nan)
+    lo = np.full((T, R), np.nan)
+    if len(tape.trade_step):
+        s_, r_ = tape.trade_step.astype(np.int64), tape.trade_runner.astype(np.int64)
+        tk, v = tape.trade_tick.astype(np.int64), tape.trade_vol.astype(np.float64)
+        keep = (s_ < T) & (r_ < R) & (tk >= 0)
+        s_, r_, tk, v = s_[keep], r_[keep], tk[keep], v[keep]
+        p = PRICES[tk]
+        np.add.at(vol, (s_, r_), v)
+        np.add.at(pv, (s_, r_), v * p)
+        prev = np.maximum(s_ - 1, 0)
+        pbl, pbb = lt[prev, r_, 0], bt[prev, r_, 0]
+        is_b = (pbl >= 0) & (tk >= pbl)
+        is_l = (pbb >= 0) & (tk <= pbb)
+        amb = ~is_b & ~is_l
+        np.add.at(bvol, (s_, r_), v * (is_b + 0.5 * amb))
+        np.add.at(lvol, (s_, r_), v * (is_l + 0.5 * amb))
+        np.fmax.at(hi, (s_, r_), p)
+        np.fmin.at(lo, (s_, r_), p)
+    cv, cpv = np.cumsum(vol, 0), np.cumsum(pv, 0)
+    w = steps(WIN_S)
+    vol_w, pv_w = _window_sum(cv, w), _window_sum(cpv, w)
     with np.errstate(all="ignore"):
-        max_m = np.fmax.accumulate(seed, axis=0)
-        min_m = np.fmin.accumulate(seed, axis=0)
-    max_m = np.where(np.isnan(max_m), fair_filled, max_m)
-    min_m = np.where(np.isnan(min_m), fair_filled, min_m)
-    max_roll = _rolling(seed, k, np.nanmax)
-    min_roll = _rolling(seed, k, np.nanmin)
-    max_roll = np.where(np.isnan(max_roll), max_m, max_roll)
-    min_roll = np.where(np.isnan(min_roll), min_m, min_roll)
+        vwap = np.where(cv > 0, cpv / cv, ref)
+        vwap_w = np.where(vol_w > 1e-9, pv_w / vol_w, ref)
+        max_m = np.fmax.accumulate(hi, axis=0)
+        min_m = np.fmin.accumulate(lo, axis=0)
+    max_m, min_m = np.where(np.isnan(max_m), ref, max_m), np.where(np.isnan(min_m), ref, min_m)
+    max_w, min_w = _window_reduce(hi, w, np.nanmax), _window_reduce(lo, w, np.nanmin)
+    max_w, min_w = np.where(np.isnan(max_w), max_m, max_w), np.where(np.isnan(min_w), min_m, min_w)
+    fb = _window_sum(np.cumsum(bvol, 0), steps(FLOW_S))
+    fl = _window_sum(np.cumsum(lvol, 0), steps(FLOW_S))
+    flow = np.where(fb + fl > 1e-9, (fb - fl) / np.maximum(fb + fl, 1e-9), 0.0)
+    vol_recent = _window_sum(cv, steps(RECENT_S))
+    last_trade = np.where(vol > 0, np.arange(T)[:, None], -1)
+    np.maximum.accumulate(last_trade, axis=0, out=last_trade)
+    secs_since = np.where(last_trade >= 0, (np.arange(T)[:, None] - last_trade) * dt, 3600.0)
+    tv = np.maximum(cv, tape.tv.astype(np.float64))
+    tv_tot = tv.sum(1, keepdims=True)
 
-    spread_ticks = np.zeros((T, R))
-    for t in range(T):
-        for r in range(R):
-            if has_back[t, r] and has_lay[t, r]:
-                spread_ticks[t, r] = price_to_tick(lay_p[t, r, 0]) - price_to_tick(back_p[t, r, 0])
+    # ---- book features
+    def lp(tk):
+        return np.where(tk >= 0, np.log(PRICES[np.clip(tk, 0, None)]), 0.0)
 
-    def lg(x):
-        with np.errstate(all="ignore"):
-            return np.log(np.clip(x, 1.0, 1000.0))
+    sb3, sl3 = bs[..., :3].sum(-1), ls[..., :3].sum(-1)
+    sba, sla = bs.sum(-1), ls.sum(-1)
+
+    def wom(a, b):
+        return np.where(a + b > 0, a / np.maximum(a + b, 1e-9), 0.5)
+
+    pw = (np.where(bt >= 0, PRICES[np.clip(bt, 0, None)], 0) * bs).sum(-1) \
+        + (np.where(lt >= 0, PRICES[np.clip(lt, 0, None)], 0) * ls).sum(-1)
+    book_wap = np.where(sba + sla > 0, pw / np.maximum(sba + sla, 1e-9), ref)
+    spread = np.where(has_b & has_l, lt[..., 0] - bt[..., 0], 0)
+    prob = np.where(fair > 0, 1.0 / np.where(fair > 0, fair, 1.0), 0.0)
+    fair_prob = prob / np.maximum(prob.sum(1, keepdims=True), 1e-9)
+    spn = tape.spn.astype(np.float64)
 
     def rel(x):
         with np.errstate(all="ignore"):
-            return np.log(np.maximum(x, 1.0) / fair_filled)
+            return np.nan_to_num(np.log(np.clip(x, 1.01, 1000.0) / ref))
 
-    tv_total = tv.sum(1, keepdims=True)
-    feats = {
-        **{f"log_back_p{k + 1}": np.nan_to_num(lg(back_p[..., k])) for k in range(LEVELS)},
-        **{f"log_lay_p{k + 1}": np.nan_to_num(lg(lay_p[..., k])) for k in range(LEVELS)},
-        **{f"log1p_back_s{k + 1}": np.log1p(back_s[..., k]) for k in range(LEVELS)},
-        **{f"log1p_lay_s{k + 1}": np.log1p(lay_s[..., k]) for k in range(LEVELS)},
-        "has_back": has_back.astype(float), "has_lay": has_lay.astype(float),
-        "log_ltp": lg(ltp), "log_micro": lg(fair_filled),
-        "prob_implied": prob_implied, "fair_prob": fair_prob,
-        "rel_spread": np.clip(np.nan_to_num(stack("rel_spread")), 0, 2),
-        "spread_ticks": np.clip(spread_ticks, 0, 50) / 10.0,
-        "ob_imbalance": np.nan_to_num(stack("ob_imbalance")),
-        "wom_l1": wom_l1, "wom_3l": wom_3l,
-        "book_wap_rel": rel(book_wap), "vwap_rel": rel(vwap), "vwap_roll_rel": rel(vwap_roll),
+    rets = {}
+    for lag in RET_LAGS_S:
+        k = steps(lag)
+        r = np.zeros((T, R))
+        with np.errstate(all="ignore"):
+            r[k:] = np.log(fair_ff[k:] / fair_ff[:-k])
+        rets[f"ret_{lag}s"] = 10 * np.nan_to_num(r)
+
+    static = getattr(tape, "static", None)
+    has_static = static is not None and static.shape[-1] == N_STATIC
+    st = np.zeros((T, R, N_STATIC))
+    if has_static:
+        st[:] = np.nan_to_num(np.asarray(static, np.float64)[:R])[None]
+
+    f = {
+        **{f"log_back_p{k + 1}": lp(bt[..., k]) for k in range(3)},
+        **{f"log_lay_p{k + 1}": lp(lt[..., k]) for k in range(3)},
+        **{f"log1p_back_s{k + 1}": np.log1p(bs[..., k]) for k in range(3)},
+        **{f"log1p_lay_s{k + 1}": np.log1p(ls[..., k]) for k in range(3)},
+        "has_back": has_b, "has_lay": has_l,
+        "log1p_back_depth": np.log1p(sba), "log1p_lay_depth": np.log1p(sla),
+        "log_ltp": np.nan_to_num(np.log(np.where(np.isnan(ltp_p), 1.0, ltp_p))),
+        "log_fair": np.log(np.where(fair > 0, fair, 1.0)),
+        "fair_prob": fair_prob, "spread_ticks": np.clip(spread, 0, 50) / 10.0,
+        "wom_l1": wom(bs[..., 0], ls[..., 0]), "wom_l3": wom(sb3, sl3), "wom_all": wom(sba, sla),
+        "book_wap_rel": rel(book_wap), "vwap_rel": rel(vwap), "vwap_win_rel": rel(vwap_w),
         "max_matched_rel": rel(max_m), "min_matched_rel": rel(min_m),
-        "max_matched_roll_rel": rel(max_roll), "min_matched_roll_rel": rel(min_roll),
-        "log1p_tv": np.log1p(tv), "log1p_tv_60s": np.log1p(np.nan_to_num(stack("traded_vol_60s"))),
-        "log1p_dvol": np.log1p(dvol),
-        "vol_share": np.where(tv_total > 0, tv / np.maximum(tv_total, eps), 0.0),
-        "log1p_secs_since_trade": np.log1p(np.clip(np.nan_to_num(stack("secs_since_last_trade"), nan=999.0), 0, 1e4)),
-        "ret_std_5s": 10 * np.nan_to_num(stack("ret_std_5s")),
-        "ret_std_20s": 10 * np.nan_to_num(stack("ret_std_20s")),
-        **{f"ret_{l}": 10 * _lag_ret(fair_filled, l) for l in RET_LAGS},
-        "ltp_rel": rel(ltp),
-        "rank_norm": rank / float(MAX_RUNNERS), "is_fav": (rank == 1).astype(float),
-        "active": active.astype(float),
+        "max_matched_win_rel": rel(max_w), "min_matched_win_rel": rel(min_w),
+        "log1p_tv": np.log1p(tv), "log1p_vol_win": np.log1p(vol_w),
+        "log1p_vol_recent": np.log1p(vol_recent), "flow_imbalance": flow,
+        "vol_share": np.where(tv_tot > 0, tv / np.maximum(tv_tot, 1e-9), 0.0),
+        "log1p_secs_since_trade": np.log1p(secs_since),
+        **rets,
+        "ltp_rel": np.where(np.isnan(ltp_p), 0.0, rel(np.nan_to_num(ltp_p, nan=1.0))),
+        "spn_rel": np.where(spn > 1.0, rel(spn), 0.0), "has_spn": spn > 1.0,
+        "rank_norm": rank / float(MAX_RUNNERS), "is_fav": rank == 1, "active": priced,
+        **{f"static_{i}": st[..., i] for i in range(N_STATIC)},
     }
-    runner_feats = np.stack([feats[n] for n in RUNNER_FEATURES], axis=2)
-    runner_feats = np.where(active[..., None], runner_feats, 0.0)
-    runner_feats = np.nan_to_num(runner_feats, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    runner = np.stack([np.asarray(f[n], np.float64) for n in RUNNER_FEATURES], axis=2)
+    runner = np.where(priced[..., None], runner, 0.0)
+    runner = np.nan_to_num(runner, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
-    # ---------------- global features ----------------
-    ts = _col(d, "ts_unix", np.nan) / 1000.0
-    if np.isnan(ts).all():
-        ts = np.arange(T, dtype=np.float64) * 1.33
-    ts = _ffill(ts[:, None])[:, 0]
-    dt = np.zeros(T)
-    dt[1:] = np.clip(np.diff(ts), 0, 30)
-    tm = np.nan_to_num(_ffill(_col(d, "total_matched_market")[:, None])[:, 0])
+    # ---- global features
+    with np.errstate(all="ignore"):
+        bo = np.where(has_b & tape.active, 1.0 / PRICES[np.clip(bt[..., 0], 0, None)], 0).sum(1)
+        lo_ = np.where(has_l & tape.active, 1.0 / PRICES[np.clip(lt[..., 0], 0, None)], 0).sum(1)
+        ent = -(np.where(fair_prob > 0, fair_prob * np.log(np.maximum(fair_prob, 1e-12)), 0)).sum(1)
+    sp = np.sort(fair_prob, axis=1)[:, ::-1]
+    fav_gap = sp[:, 0] - (sp[:, 1] if R > 1 else 0)
+    n_pr = priced.sum(1)
+    tm = tape.total_matched.astype(np.float64)
+    k30 = steps(30)
     dtm = np.zeros(T)
-    dtm[1:] = np.log1p(np.maximum(np.diff(tm), 0))
-    code = str(d["race_code"].iloc[0]) if "race_code" in d.columns else "?"
-    commission = _col(d, "commission_rate", 0.05)[0]
-    commission = 0.05 if np.isnan(commission) else float(commission)
+    dtm[k30:] = np.log1p(np.maximum(tm[k30:] - tm[:-k30], 0))
     g = {
-        "secs_to_off": np.clip(np.nan_to_num(_col(d, "secs_to_off")), -600, 3600) / 600.0,
-        "log1p_total_matched": np.log1p(tm) / 10.0,
-        "dlog_total_matched": dtm,
-        "back_overround": np.nan_to_num(_col(d, "back_overround"), nan=100.0) / 100.0 - 1.0,
-        "lay_overround": np.nan_to_num(_col(d, "lay_overround"), nan=100.0) / 100.0 - 1.0,
-        "overround_gap": np.clip(np.nan_to_num(_col(d, "overround_gap")), -100, 100) / 100.0,
-        "prob_entropy": np.nan_to_num(_col(d, "prob_entropy")),
-        "fav_prob_gap": np.nan_to_num(_col(d, "fav_prob_gap")),
-        "spread_mean_run": np.nan_to_num(_col(d, "spread_mean_run")),
-        "spread_std_run": np.nan_to_num(_col(d, "spread_std_run")),
-        "runner_count": np.full(T, R / float(MAX_RUNNERS)),
-        "n_active": active.sum(1) / float(MAX_RUNNERS),
-        "commission": np.full(T, commission),
-        "is_flat": np.full(T, float(code == "Flat")),
-        "is_harness": np.full(T, float(code == "Harness")),
-        "is_other_code": np.full(T, float(code not in ("Flat", "Harness"))),
-        "distance": np.full(T, np.nan_to_num(_col(d, "distance_m", 0.0)[0]) / 3000.0),
-        "dt": dt / 5.0,
+        "t_rel": np.clip(tape.t_rel.astype(np.float64), -900, 600) / 600.0,
+        "log1p_total_matched": np.log1p(tm) / 10.0, "dlog_total_matched_30s": dtm / 10.0,
+        "back_overround": bo - 1.0, "lay_overround": lo_ - 1.0,
+        "prob_entropy": ent, "fav_prob_gap": fav_gap,
+        "mean_spread_ticks": np.where(n_pr > 0, (np.clip(spread, 0, 50) * priced).sum(1)
+                                      / np.maximum(n_pr, 1), 0) / 10.0,
+        "n_active": n_pr / float(MAX_RUNNERS), "runner_count": np.full(T, R / float(MAX_RUNNERS)),
+        "commission": np.full(T, commission), "suspended": tape.suspended.astype(np.float64),
+        "has_static": np.full(T, float(has_static)),
     }
-    global_feats = np.stack([g[n] for n in GLOBAL_FEATURES], axis=1)
-    global_feats = np.nan_to_num(global_feats, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
-
-    is_winner = np.array([np.nan_to_num(_col(df, f"run[{i}].is_winner", 0.0)).max() for i in range(R)])
-    market_id = str(df["file_market_id"].iloc[0]) if "file_market_id" in df.columns else ""
-    race_date = str(df["race_date"].iloc[0]) if "race_date" in df.columns else ""
-
-    return RaceData(
-        path=path, market_id=market_id, race_date=race_date, commission=commission,
-        n_runners=R, T=T, in_play_found=in_play_found,
-        back_p=back_p, back_s=back_s, lay_p=lay_p, lay_s=lay_s,
-        ltp=ltp, tv=tv, fair=fair_filled, rank=rank, active=active, ts=ts,
-        runner_feats=runner_feats, global_feats=global_feats, is_winner=is_winner,
-    )
+    glob = np.stack([g[n] for n in GLOBAL_FEATURES], axis=1)
+    glob = np.nan_to_num(glob, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    return TapeFeatures(runner=runner, glob=glob, fair=fair, rank=rank, priced=priced)
