@@ -202,3 +202,59 @@ def test_agent_checkpoint_roundtrip(tmp_path, real):
     agent.save(tmp_path / "a.pt")
     agent2, _ = SACAgent.load(tmp_path / "a.pt", device="cpu")
     np.testing.assert_allclose(agent.act(obs, True), agent2.act(obs, True), atol=1e-6)
+
+
+# ---------------------------------------------------------------- SAC / training loop
+def _filled_buffer(n=64, dim=None, seed=0):
+    from single_runner.sac import ReplayBuffer
+    dim = dim or obs_dim()
+    rng = np.random.default_rng(seed)
+    buf = ReplayBuffer(dim, 6, n)
+    for _ in range(n):
+        buf.add(rng.normal(3, 2, dim), rng.uniform(-1, 1, 6), rng.normal(), rng.normal(3, 2, dim), 0.0)
+    return buf
+
+
+def test_alpha_floor_holds():
+    from single_runner.sac import SACAgent, SACConfig
+    cfg = SACConfig(hidden=(16,), batch_size=16, lr=0.5, target_entropy=-1e3, alpha_min=0.02, device="cpu")
+    agent = SACAgent(obs_dim(), 6, cfg)
+    buf = _filled_buffer()
+    for _ in range(20):
+        stats = agent.update(buf)
+    assert agent.alpha == pytest.approx(0.02, rel=1e-5) and stats["alpha"] >= 0.02 - 1e-6
+
+
+def test_update_normalises_like_running_norm(monkeypatch):
+    from single_runner.sac import SACAgent, SACConfig
+    agent = SACAgent(obs_dim(), 6, SACConfig(hidden=(16,), batch_size=8, device="cpu"))
+    buf = _filled_buffer()
+    agent.norm.update(buf.obs[:64].astype(np.float32))
+    seen = []
+    orig = agent.critic.forward
+    monkeypatch.setattr(agent.critic, "forward", lambda o, a: (seen.append(o.detach().clone()), orig(o, a))[1])
+    np.random.seed(1)
+    idx = np.random.randint(0, len(buf), 8)
+    np.random.seed(1)
+    agent.update(buf)
+    np.testing.assert_allclose(seen[0].numpy(), agent.norm(buf.obs[idx].astype(np.float32)), atol=1e-4)
+
+
+def test_best_checkpoint_only_if_it_beats_do_nothing(tmp_path, real, monkeypatch):
+    import single_runner.train as tr
+    from single_runner.sac import SACConfig
+    (tmp_path / "best.pt").write_text("stale")
+    path = str(tmp_path / "race.npz")
+    real.save(path)
+    cfg = EnvConfig(decision_every=1, min_decisions=5)
+    fake = lambda pnl: (lambda agent, env, specs, deterministic=True: [
+        {"pnl": pnl, "race": "r", "target_rank": 1, "back_matched": 1.0, "lay_matched": 0.0,
+         "n_fills": 1, "n_passive": 0, "void": False}])
+    monkeypatch.setattr(tr, "evaluate", fake(-1.0))
+    tr.train([path], [path], str(tmp_path), cfg, SACConfig(hidden=(16,), learning_starts=10, buffer_size=100,
+             batch_size=8, device="cpu"), total_steps=20, eval_every=10, val_episodes=5)
+    assert not (tmp_path / "best.pt").exists() and (tmp_path / "last.pt").exists()
+    monkeypatch.setattr(tr, "evaluate", fake(+1.0))
+    tr.train([path], [path], str(tmp_path), cfg, SACConfig(hidden=(16,), learning_starts=10, buffer_size=100,
+             batch_size=8, device="cpu"), total_steps=20, eval_every=10, val_episodes=5, final_full_val=False)
+    assert (tmp_path / "best.pt").exists()

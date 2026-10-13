@@ -8,7 +8,7 @@ Episode  = (tape, target rank). The target is the runner holding that
            its own episode.
 Start    = $100 balance (configurable). Betfair funds check: worst-case loss over
            outcomes, including unmatched orders, never exceeds the balance.
-Actions  = Box(-1, 1, (6,)) every `decision_every` tape steps (default 4 = 2 s):
+Actions  = Box(-1, 1, (6,)) every `decision_every` tape steps (default 20 = 10 s):
              0 back size   : stake = max(a, 0) * max affordable back stake
              1 back price  : round(a * tick_range) ticks from the best atb price
                              (+ = higher odds = passive, - = aggressive)
@@ -56,7 +56,7 @@ class EnvConfig:
     min_stake: float = 5.0             # Betfair AU minimum for opening orders
     tick_range: int = 10               # price action spans +/- this many ladder ticks
     max_open_orders: int = 20          # per side
-    decision_every: int = 4            # tape steps per decision (0.5 s grid -> 2 s)
+    decision_every: int = 20           # tape steps per decision (0.5 s grid -> 10 s)
     latency_steps: int = 1             # orders/cancels land one tape step later
     fill_mode: str = "realistic"       # ahr_rl fill model: realistic | no_queue | touch
     cross_matching: bool = True

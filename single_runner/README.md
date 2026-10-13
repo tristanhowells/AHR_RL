@@ -34,7 +34,7 @@ Useful flags:
 | `--ranks 1,2,3` | train only on these favouritism ranks |
 | `--race-type flat` | race filter shared with the research studies |
 | `--metro-only` | race filter shared with the research studies |
-| `--decision-every 20` | decide every 10 s instead of every 2 s |
+| `--decision-every 4` | decide every 2 s instead of the default 10 s |
 | `--fill-mode no_queue` | optimistic fill-sensitivity check |
 | `--greenup cross` | green up by walking the book (pays the spread) |
 
@@ -63,7 +63,9 @@ Useful flags:
 * Episodes start `start_s` (600) seconds before the scheduled off and end when
   the market turns in-play. `--random-start-s` delays the start at random
   during training.
-* The agent decides every `decision_every` tape steps, 2 s by default.
+* The agent decides every `decision_every` tape steps: 20, i.e. 10 s, by
+  default (the research V2 setting). That is about 60 decisions per race,
+  which makes credit assignment easier than at 2 s.
 * If the target is scratched mid-race, its bets are void and the episode ends
   with a P&L of 0.
 
@@ -156,9 +158,27 @@ instead (pessimistic) and is also reported by `--eval-test`.
 * **Reward:** the change in greened, post-commission equity / balance ×
   `reward_scale`. It telescopes to the final P&L, and doing nothing scores
   exactly 0.
-* **`val_metrics.csv`:** mean and median P&L, `t_race` (t-stat with races as
-  the unit, since a race's ranks aren't independent), win rate, trade rate,
-  matched volume, passive fill share, and mean P&L for each rank.
+* **`val_metrics.csv`:** written every `--eval-every` steps on a fixed subset
+  of `--val-episodes` (300) validation episodes. Columns: mean and median P&L,
+  `t_race` (t-stat with races as the unit, since a race's ranks aren't
+  independent), win rate, trade rate, matched volume, passive fill share, and
+  mean P&L for each rank.
+* **Checkpoint rule:** `best.pt` is written only when the validation mean P&L
+  beats doing nothing (> 0). Any `best.pt` left from an earlier run in the
+  same folder is deleted at the start. At the end, `best.pt` is re-scored on
+  the **full** validation set (`val_full_best.json`). If no checkpoint beat 0,
+  there is no `best.pt` and nothing should go to TEST.
 * **`--eval-test`:** scores a checkpoint once on TEST, under both the fair and
   cross green-up rules.
 * **Bar to beat:** use the research gate, mean > 0 with t > 2 on TEST.
+
+## Agent and speed
+
+* **Entropy floor:** `alpha_min` (`--alpha-min`, default 0.02). Without it,
+  auto-tuning pushed `alpha` to about 0 within 100 episodes of the first real
+  run. That left nothing paying the agent to keep exploring once early losses
+  pushed it towards not trading.
+* **Normalisation:** replay batches are normalised on the training device.
+* **GPU required in practice.** On CPU, one SAC update is about 86 ms (about
+  5–10 steps/s on Colab), so 500k steps would take days. `train()` prints the
+  device and warns on CPU, and the notebook stops if there's no GPU.

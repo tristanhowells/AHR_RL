@@ -5,7 +5,9 @@ emits a 6-dim action in [-1, 1]. Components:
   * tanh-squashed Gaussian actor, twin Q critics + Polyak target nets
   * automatic entropy tuning (target entropy = -action_dim)
   * running observation normalisation (frozen at evaluation)
-  * float16 replay storage (obs are ~1.2k dims) to keep memory sane
+  * float16 replay storage (obs are ~1.7k dims) to keep memory sane; batches are
+    normalised on the training device, not in numpy
+  * an entropy floor (alpha_min) so auto-tuning can't switch exploration off
 """
 from dataclasses import dataclass, asdict
 
@@ -28,6 +30,7 @@ class SACConfig:
     learning_starts: int = 5_000
     updates_per_step: int = 1
     init_alpha: float = 0.1
+    alpha_min: float = 0.02           # entropy floor: keeps exploring after early losses
     target_entropy: float = None      # default -action_dim
     grad_clip: float = 10.0
     obs_clip: float = 10.0
@@ -79,9 +82,9 @@ class ReplayBuffer:
         return self.size if self.full else self.ptr
 
     def sample(self, n):
+        """Raw batch; observations stay float16 (cast on the training device)."""
         idx = np.random.randint(0, len(self), n)
-        return (self.obs[idx].astype(np.float32), self.act[idx], self.rew[idx],
-                self.next_obs[idx].astype(np.float32), self.done[idx])
+        return self.obs[idx], self.act[idx], self.rew[idx], self.next_obs[idx], self.done[idx]
 
 
 def mlp(inp, out, hidden):
@@ -159,8 +162,14 @@ class SACAgent:
     def update(self, buf):
         c = self.cfg
         o, a, r, o2, d = buf.sample(c.batch_size)
-        o = torch.as_tensor(self.norm(o), device=self.device)
-        o2 = torch.as_tensor(self.norm(o2), device=self.device)
+        mean = torch.as_tensor(self.norm.mean, dtype=torch.float32, device=self.device)
+        inv_std = torch.as_tensor(1.0 / np.sqrt(self.norm.var + 1e-8), dtype=torch.float32, device=self.device)
+
+        def normed(x):
+            x = torch.from_numpy(x).to(self.device, non_blocking=True).float()
+            return ((x - mean) * inv_std).clamp_(-self.norm.clip, self.norm.clip)
+
+        o, o2 = normed(o), normed(o2)
         a = torch.as_tensor(a, device=self.device)
         r = torch.as_tensor(r, device=self.device)
         d = torch.as_tensor(d, device=self.device)
@@ -193,6 +202,9 @@ class SACAgent:
         self.opt_alpha.zero_grad()
         loss_alpha.backward()
         self.opt_alpha.step()
+        if c.alpha_min:
+            with torch.no_grad():
+                self.log_alpha.clamp_(min=float(np.log(c.alpha_min)))
 
         with torch.no_grad():
             for p, pt in zip(self.critic.parameters(), self.critic_targ.parameters()):
