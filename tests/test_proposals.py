@@ -370,3 +370,23 @@ def test_runner_agents():
     assert critic(r, g, m, act).shape == (1, R_MAX)
     fa = flat_action(act[0].detach().numpy())
     assert fa.shape == (N_ACT * R_MAX,) and np.allclose(fa[:R_MAX], act[0, :, 0].detach().numpy())
+
+
+def test_crossmatch_virtual():
+    from ahr_rl.crossmatch_study import _virtual
+    from ahr_rl.ladder import PRICES, price_to_tick
+
+    tick = np.array([[price_to_tick(2.0), price_to_tick(4.0), price_to_tick(5.0)]])
+    size = np.array([[10.0, 20.0, 30.0]])
+    live = np.ones((1, 3), bool)
+    vt, vs = _virtual(tick, size, live, round_down=True)  # virtual price to back each runner
+    # runner 0: 1 / (1 - 1/4 - 1/5) = 1.818 -> 1.81 (rounded against us); runner 1: 3.33 -> 3.30; runner 2: 4.0
+    assert [float(PRICES[x]) for x in vt[0]] == [1.81, 3.3, 4.0]
+    # size is limited by the thinnest other leg (size * price): runner 0 by runner 1 (80), others by runner 0 (20)
+    assert np.allclose(vs[0], [80 / 1.81, 20 / 3.3, 20 / 4.0])
+    vt_l, _ = _virtual(tick, size, live, round_down=False)  # lay side rounds up
+    assert [float(PRICES[x]) for x in vt_l[0]] == [1.82, 3.35, 4.0]
+    tick[0, 2] = -1  # one runner uncovered -> no virtual offers at all
+    assert (_virtual(tick, size, live, True)[0] == -1).all()
+    live[0, 2] = False  # ... unless that runner is no longer live
+    assert (_virtual(tick, size, live, True)[0][0, :2] >= 0).all()
