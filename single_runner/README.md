@@ -158,16 +158,26 @@ instead (pessimistic) and is also reported by `--eval-test`.
 * **Reward:** the change in greened, post-commission equity / balance ×
   `reward_scale`. It telescopes to the final P&L, and doing nothing scores
   exactly 0.
-* **`val_metrics.csv`:** written every `--eval-every` steps on a fixed subset
-  of `--val-episodes` (300) validation episodes. Columns: mean and median P&L,
-  `t_race` (t-stat with races as the unit, since a race's ranks aren't
-  independent), win rate, trade rate, matched volume, passive fill share, and
-  mean P&L for each rank.
-* **Checkpoint rule:** `best.pt` is written only when the validation mean P&L
-  beats doing nothing (> 0). Any `best.pt` left from an earlier run in the
-  same folder is deleted at the start. At the end, `best.pt` is re-scored on
-  the **full** validation set (`val_full_best.json`). If no checkpoint beat 0,
-  there is no `best.pt` and nothing should go to TEST.
+* **Validation split:** the date split gives validation 20% of days and TEST
+  15%. Validation is then split **by race** into two parts:
+  * a **selection set** of about `--val-episodes` (300) episodes, used for the
+    periodic checks that pick `best.pt`;
+  * a disjoint **hold-out set** (all the other validation races), used once,
+    at the end.
+* **`val_metrics.csv`:** written every `--eval-every` steps on the selection
+  set. Columns: mean and median P&L, `t_race` (t-stat with races as the unit,
+  since a race's ranks aren't independent), win rate, trade rate, matched
+  volume, passive fill share, and mean P&L for each rank.
+* **Checkpoint rule:** `best.pt` is written only when selection-set mean P&L
+  beats doing nothing (> 0).
+* **Hold-out check:** at the end, `best.pt` is scored on the hold-out races
+  under both green-up rules and the result goes to `val_holdout_best.json`.
+  Picking the best of many looks at one set inflates its score, which is why
+  the hold-out exists.
+* **TEST gate:** `best.pt` reaches TEST only if the hold-out shows mean > 0
+  **and** t > 2. The notebook's TEST cell and `--eval-test` both refuse
+  otherwise; `--force-test` overrides the CLI check. Any `best.pt` or verdict
+  left from an earlier run in the same folder is deleted at the start.
 * **`--eval-test`:** scores a checkpoint once on TEST, under both the fair and
   cross green-up rules.
 * **Bar to beat:** use the research gate, mean > 0 with t > 2 on TEST.

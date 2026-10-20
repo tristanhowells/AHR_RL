@@ -1,5 +1,6 @@
 """Single-runner env on stream tapes. Fill mechanics themselves are ahr_rl's and
 are covered by tests/test_exchange.py; these tests cover what single_runner adds."""
+import json
 import os
 import warnings
 from dataclasses import replace
@@ -240,21 +241,55 @@ def test_update_normalises_like_running_norm(monkeypatch):
     np.testing.assert_allclose(seen[0].numpy(), agent.norm(buf.obs[idx].astype(np.float32)), atol=1e-4)
 
 
-def test_best_checkpoint_only_if_it_beats_do_nothing(tmp_path, real, monkeypatch):
-    import single_runner.train as tr
+def _fake_eval(pnl):
+    def ev(agent, env, specs, deterministic=True):
+        return [{"pnl": pnl + 0.01 * k, "race": f"r{k}", "target_rank": 1, "back_matched": 1.0,
+                 "lay_matched": 0.0, "n_fills": 1, "n_passive": 0, "void": False} for k in range(5)]
+    return ev
+
+
+def _tiny_train(tr, tmp_path, paths, **kw):
     from single_runner.sac import SACConfig
+    return tr.train(paths, paths, str(tmp_path), EnvConfig(decision_every=1, min_decisions=5),
+                    SACConfig(hidden=(16,), learning_starts=10, buffer_size=100, batch_size=8, device="cpu"),
+                    total_steps=20, eval_every=10, seed=0, **kw)
+
+
+def test_val_split_is_disjoint_by_race(real, syn):
+    from single_runner.train import split_val_races
+    tapes = [real, syn, make_synthetic_tape(8), make_synthetic_tape(9)]
+    env = SingleRunnerTradingEnv(tapes, EnvConfig(decision_every=1))
+    select, hold, n_hold = split_val_races(env, tapes, select_episodes=8, seed=0)
+    sel_ids = {id(sp["tape"]) for sp in select}
+    assert sel_ids and hold and not sel_ids & {id(t) for t in hold}
+    assert len(select) + n_hold == len(episode_specs(env, tapes))
+
+
+def test_best_checkpoint_and_holdout_gate(tmp_path, real, monkeypatch):
+    import single_runner.train as tr
+    paths = []
+    for k in range(3):                               # 3 races: selection + hold-out
+        paths.append(str(tmp_path / f"2026090{k}_race.npz"))
+        real.save(paths[-1])
     (tmp_path / "best.pt").write_text("stale")
-    path = str(tmp_path / "race.npz")
-    real.save(path)
-    cfg = EnvConfig(decision_every=1, min_decisions=5)
-    fake = lambda pnl: (lambda agent, env, specs, deterministic=True: [
-        {"pnl": pnl, "race": "r", "target_rank": 1, "back_matched": 1.0, "lay_matched": 0.0,
-         "n_fills": 1, "n_passive": 0, "void": False}])
-    monkeypatch.setattr(tr, "evaluate", fake(-1.0))
-    tr.train([path], [path], str(tmp_path), cfg, SACConfig(hidden=(16,), learning_starts=10, buffer_size=100,
-             batch_size=8, device="cpu"), total_steps=20, eval_every=10, val_episodes=5)
+    (tmp_path / "val_holdout_best.json").write_text('{"gate": true}')
+    # nothing beats do-nothing: stale artefacts removed, no best.pt, gate closed
+    monkeypatch.setattr(tr, "evaluate", _fake_eval(-1.0))
+    _tiny_train(tr, tmp_path, paths, val_episodes=9)
     assert not (tmp_path / "best.pt").exists() and (tmp_path / "last.pt").exists()
-    monkeypatch.setattr(tr, "evaluate", fake(+1.0))
-    tr.train([path], [path], str(tmp_path), cfg, SACConfig(hidden=(16,), learning_starts=10, buffer_size=100,
-             batch_size=8, device="cpu"), total_steps=20, eval_every=10, val_episodes=5, final_full_val=False)
-    assert (tmp_path / "best.pt").exists()
+    assert not tr.test_gate(str(tmp_path))[0]
+    # beats do-nothing on selection AND hold-out (mean > 0, t > 2): gate opens
+    monkeypatch.setattr(tr, "evaluate", _fake_eval(+1.0))
+    _tiny_train(tr, tmp_path, paths, val_episodes=9)
+    v = json.load(open(tmp_path / "val_holdout_best.json"))
+    assert (tmp_path / "best.pt").exists() and v["hold_out_races"] >= 1 and v["gate"]
+    assert tr.test_gate(str(tmp_path))[0]
+    # positive on selection but weak on hold-out: best.pt exists, gate stays closed
+    calls = []
+
+    def mixed(agent, env, specs, deterministic=True):
+        calls.append(1)
+        return _fake_eval(+1.0 if len(calls) <= 2 else -0.5)(agent, env, specs)
+    monkeypatch.setattr(tr, "evaluate", mixed)
+    _tiny_train(tr, tmp_path, paths, val_episodes=9)
+    assert (tmp_path / "best.pt").exists() and not tr.test_gate(str(tmp_path))[0]

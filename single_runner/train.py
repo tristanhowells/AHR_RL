@@ -70,12 +70,25 @@ def summarise(rows):
     return out
 
 
-def eval_specs(env, tapes, max_episodes=None, seed=0):
-    specs = episode_specs(env, tapes)
-    if max_episodes and len(specs) > max_episodes:
-        rng = np.random.default_rng(seed)
-        specs = [specs[i] for i in sorted(rng.choice(len(specs), max_episodes, replace=False))]
-    return specs
+def split_val_races(env, val_tapes, select_episodes=300, seed=0):
+    """Split validation by RACE into a selection set (~select_episodes episodes, used for
+    the periodic checks that pick best.pt) and a disjoint hold-out set (used once, to
+    check best.pt). Races, not episodes, so no race contributes to both sides."""
+    eps = {}
+    for sp in episode_specs(env, val_tapes):
+        eps.setdefault(sp["tape"] if isinstance(sp["tape"], str) else id(sp["tape"]), []).append(sp)
+    keys = list(eps)
+    order = np.random.default_rng(seed).permutation(len(keys))
+    select, hold, n = [], [], 0
+    for i in order:
+        if n < select_episodes:
+            select.append(keys[i])
+            n += len(eps[keys[i]])
+        else:
+            hold.append(keys[i])
+    by_key = {(t if isinstance(t, str) else id(t)): t for t in val_tapes}
+    return ([sp for k in select for sp in eps[k]], [by_key[k] for k in hold],
+            sum(len(eps[k]) for k in hold))
 
 
 def _append_csv(path, row):
@@ -96,11 +109,13 @@ def _device_banner(agent):
 
 
 def train(train_tapes, val_tapes, out_dir, env_cfg, sac_cfg, total_steps=500_000,
-          eval_every=25_000, val_episodes=300, seed=0, log_every_eps=50, final_full_val=True):
-    """Train; checkpoint selection on a fixed validation subset, final check on full validation.
+          eval_every=25_000, val_episodes=300, seed=0, log_every_eps=50, final_check=True):
+    """Train; pick best.pt on a validation selection set, then check it once on held-out val races.
 
-    `best.pt` is written only for a checkpoint whose validation mean P&L beats doing
-    nothing (> 0). If none does, there is no best.pt and nothing should go to TEST.
+    `best.pt` is written only for a checkpoint whose selection-set mean P&L beats doing
+    nothing (> 0). At the end it is scored on the disjoint hold-out races and the
+    verdict goes to val_holdout_best.json; the TEST gate (mean > 0, t > 2) must pass
+    there before anything is sent to TEST.
     """
     os.makedirs(out_dir, exist_ok=True)
     np.random.seed(seed)
@@ -109,10 +124,12 @@ def train(train_tapes, val_tapes, out_dir, env_cfg, sac_cfg, total_steps=500_000
     eval_cfg = EnvConfig(**{**asdict(env_cfg), "random_start_s": 0.0,
                             "cache_size": max(env_cfg.cache_size, len(val_tapes) + 1)})
     val_env = SingleRunnerTradingEnv(val_tapes, eval_cfg, seed=seed + 1)
-    all_specs = episode_specs(val_env, val_tapes)
-    specs = eval_specs(val_env, val_tapes, val_episodes, seed)
-    print(f"train races {len(train_tapes)} | val races {len(val_tapes)} | "
-          f"val episodes {len(all_specs)} (periodic subset {len(specs)})")
+    specs, hold_tapes, n_hold = split_val_races(val_env, val_tapes, val_episodes, seed)
+    print(f"train races {len(train_tapes)} | val races {len(val_tapes)}: selection {len(specs)} episodes, "
+          f"hold-out {len(hold_tapes)} races / {n_hold} episodes")
+    if not hold_tapes:
+        print("WARNING: no hold-out validation races (val set too small for --val-episodes); "
+              "best.pt can't be checked independently and the TEST gate will not pass.")
 
     obs_dim, act_dim = env.observation_space.shape[0], env.action_space.shape[0]
     agent = SACAgent(obs_dim, act_dim, sac_cfg)
@@ -122,8 +139,10 @@ def train(train_tapes, val_tapes, out_dir, env_cfg, sac_cfg, total_steps=500_000
         json.dump({"env": asdict(env_cfg), "sac": asdict(sac_cfg), "obs_dim": obs_dim,
                    "train_races": len(train_tapes), "val_races": len(val_tapes)}, f, indent=2, default=str)
     best_path = os.path.join(out_dir, "best.pt")
-    if os.path.exists(best_path):
-        os.remove(best_path)          # never let a stale best.pt from an earlier run reach TEST
+    hold_path = os.path.join(out_dir, "val_holdout_best.json")
+    for stale in (best_path, hold_path):
+        if os.path.exists(stale):
+            os.remove(stale)          # never let an earlier run's checkpoint or verdict reach TEST
     obs, _ = env.reset()
     agent.norm.update(obs)
     ep, ep_ret, best, stats, recent = 0, 0.0, 0.0, {}, []
@@ -175,14 +194,19 @@ def train(train_tapes, val_tapes, out_dir, env_cfg, sac_cfg, total_steps=500_000
 
     if not os.path.exists(best_path):
         print("No checkpoint beat do-nothing (mean P&L > 0) on validation: no best.pt, nothing to send to TEST.")
-    elif final_full_val:
-        full, extra = evaluate_checkpoint(best_path, val_tapes, eval_cfg, greenup_modes=("fair",))
-        f = full["fair"]
-        with open(os.path.join(out_dir, "val_full_best.json"), "w") as fh:
-            json.dump({"step": extra.get("step"), **f}, fh, indent=2, default=float)
-        verdict = "beats" if f["mean_pnl"] > 0 else "does NOT beat"
-        print(f"best.pt (step {extra.get('step')}) on ALL {f['episodes']} val episodes: mean {f['mean_pnl']:+.3f} "
-              f"t(race) {f['t_race']:+.2f} -> {verdict} do-nothing")
+    elif final_check:
+        verdict = {"step": None, "hold_out_races": len(hold_tapes), "gate": False}
+        if hold_tapes:
+            res, extra = evaluate_checkpoint(best_path, hold_tapes, eval_cfg)
+            f = res["fair"]
+            verdict.update(step=extra.get("step"), fair=res["fair"], cross=res["cross"],
+                           gate=bool(f["mean_pnl"] > 0 and f["t_race"] > 2))
+            print(f"best.pt (step {extra.get('step')}) on {len(hold_tapes)} HOLD-OUT val races "
+                  f"({f['episodes']} episodes): mean {f['mean_pnl']:+.3f} t(race) {f['t_race']:+.2f}; "
+                  f"cross green-up mean {res['cross']['mean_pnl']:+.3f} -> TEST gate "
+                  f"{'PASS' if verdict['gate'] else 'fail'} (needs mean > 0 and t > 2)")
+        with open(hold_path, "w") as fh:
+            json.dump(verdict, fh, indent=2, default=float)
     return agent
 
 
@@ -201,19 +225,39 @@ def evaluate_checkpoint(ckpt, tapes, env_cfg, out_csv=None, greenup_modes=("fair
     return results, extra
 
 
+def test_gate(out_dir):
+    """(ok, reason): has best.pt passed the hold-out validation gate (mean > 0, t > 2)?"""
+    if not os.path.exists(os.path.join(out_dir, "best.pt")):
+        return False, "no best.pt (no checkpoint beat do-nothing on validation)"
+    path = os.path.join(out_dir, "val_holdout_best.json")
+    if not os.path.exists(path):
+        return False, "no val_holdout_best.json (training didn't finish its hold-out check)"
+    with open(path) as fh:
+        v = json.load(fh)
+    if not v.get("gate"):
+        f = v.get("fair") or {}
+        return False, (f"best.pt failed the hold-out gate: mean {f.get('mean_pnl', float('nan')):+.3f}, "
+                       f"t(race) {f.get('t_race', float('nan')):+.2f} on {v.get('hold_out_races', 0)} races "
+                       f"(needs mean > 0 and t > 2)")
+    return True, "hold-out gate passed"
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--tapes", required=True, help='glob, e.g. "/content/tapes/*.npz"')
     p.add_argument("--out-dir", default="runs/single_runner_sac")
-    p.add_argument("--val-frac", type=float, default=0.15)
+    p.add_argument("--val-frac", type=float, default=0.20)
     p.add_argument("--test-frac", type=float, default=0.15)
     p.add_argument("--ranks", default=None, help="comma list of favouritism ranks, e.g. 1,2,3 (default all)")
     p.add_argument("--total-steps", type=int, default=500_000)
     p.add_argument("--eval-every", type=int, default=25_000)
-    p.add_argument("--val-episodes", type=int, default=300, help="fixed periodic validation subset")
+    p.add_argument("--val-episodes", type=int, default=300,
+                   help="episodes in the validation selection set; the remaining val races are the hold-out")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--eval-test", default=None, metavar="CKPT",
-                   help="skip training; score this checkpoint once on the TEST split")
+                   help="skip training; score this checkpoint once on the TEST split (requires the "
+                        "hold-out gate in OUT_DIR/val_holdout_best.json to have passed)")
+    p.add_argument("--force-test", action="store_true", help="score on TEST even if the hold-out gate failed")
     race_filter.add_args(p)
     # env
     p.add_argument("--balance", type=float, default=100.0)
@@ -250,6 +294,9 @@ def main(argv=None):
         runner_ranks=tuple(int(x) for x in a.ranks.split(",")) if a.ranks else None,
     )
     if a.eval_test:
+        gate = test_gate(a.out_dir)
+        if not gate[0] and not a.force_test:
+            raise SystemExit(f"Not scoring on TEST: {gate[1]} (override with --force-test)")
         os.makedirs(a.out_dir, exist_ok=True)
         res, extra = evaluate_checkpoint(a.eval_test, test_tapes, env_cfg,
                                          os.path.join(a.out_dir, "test_episodes.csv"))
