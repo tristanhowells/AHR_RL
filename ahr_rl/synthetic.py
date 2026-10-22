@@ -5,6 +5,13 @@ In each synthetic race one randomly chosen runner (a "steamer") shortens by one
 tick every ``trend_every_s`` seconds; everything else random-walks with no drift.
 Backing the steamer and exiting a tick or two lower is profitable; the agent
 must *recognise* the steamer from its features (the runner index is random).
+
+``make_bounce_tape`` (P17's control) plants an edge that only RESTING orders can take:
+every runner's book oscillates +-1 tick around a fixed fair price with a 2-tick spread,
+trades print at both best prices, and BSP = the fair price. Crossing never beats fair
+(backing takes at most the fair price, laying at least it), but a back resting at the
+top of the range is filled by layers there (+2 ticks at BSP) and a lay at the bottom by
+backers.
 """
 from __future__ import annotations
 
@@ -63,12 +70,55 @@ def make_synthetic_tape(seed: int, n_runners: int = 6, dt: float = 0.5, pre_s: f
     )
 
 
-def write_synthetic(out_dir: str, n: int, seed0: int = 0, trend_every_s: float = 6.0) -> list[str]:
+def make_bounce_tape(seed: int, n_runners: int = 6, dt: float = 0.5, pre_s: float = 600.0, post_s: float = 60.0,
+                     k_levels: int = 8, level_size: float = 30.0, dwell_s: float = 30.0, trade_rate: float = 0.6) -> Tape:
+    rng = np.random.default_rng(seed)
+    T = int((pre_s + post_s) / dt)
+    R, K = n_runners, k_levels
+    t_rel = (-pre_s + np.arange(T) * dt).astype(np.float32)
+    fair = rng.integers(150, 230, size=R)  # ticks ~3.0 .. 20
+    x = np.zeros((T, R), np.int64)  # oscillation around fair: -1 / 0 / +1, held ~dwell_s
+    for r in range(R):
+        cur, s = int(rng.integers(-1, 2)), 0
+        while s < T:
+            n = max(1, int(rng.exponential(dwell_s / dt)))
+            x[s:s + n, r] = cur
+            s += n
+            cur = int(np.clip(cur + rng.choice([-1, 1]), -1, 1))
+    bt0, lt0 = fair - 1 + x, fair + 1 + x  # best back / best lay, 2 ticks apart
+    bt = np.stack([bt0 - k for k in range(K)], -1).astype(np.int16)
+    lt = np.stack([lt0 + k for k in range(K)], -1).astype(np.int16)
+    bs = rng.uniform(0.5, 1.5, size=(T, R, K)).astype(np.float32) * level_size
+    ls = rng.uniform(0.5, 1.5, size=(T, R, K)).astype(np.float32) * level_size
+    trades = []
+    for s in range(1, T):
+        for r in range(R):
+            for tk in (bt0[s, r], lt0[s, r]):  # backers take the best back, layers the best lay
+                if rng.random() < trade_rate:
+                    trades.append((s, r, tk, float(rng.uniform(2, 12))))
+    tr = np.array(trades, np.float64).reshape(-1, 4)
+    from .ladder import PRICES
+    return Tape(
+        market_id=f"bounce.{seed}", name=f"20990101_bounce_{seed}", dt=dt, t_rel=t_rel,
+        back_tick=bt, back_size=bs, lay_tick=lt, lay_size=ls,
+        ltp_tick=(fair + x).astype(np.int16), tv=np.cumsum(np.ones((T, R), np.float32), 0),
+        spn=np.zeros((T, R), np.float32), active=np.ones((T, R), bool), suspended=np.zeros(T, bool),
+        total_matched=np.arange(T, dtype=np.float32) * 10,
+        trade_step=tr[:, 0].astype(np.int32), trade_runner=tr[:, 1].astype(np.int16),
+        trade_tick=tr[:, 2].astype(np.int16), trade_vol=tr[:, 3].astype(np.float32),
+        removal_step=np.zeros(0, np.int32), removal_runner=np.zeros(0, np.int16),
+        removal_factor=np.zeros(0, np.float32), selection_ids=np.arange(R, dtype=np.int64),
+        base_rate=8.0, went_in_play=True, winner=int(rng.integers(R)), bsp=PRICES[fair].astype(np.float32),
+    )
+
+
+def write_synthetic(out_dir: str, n: int, seed0: int = 0, trend_every_s: float = 6.0, kind: str = "trend") -> list[str]:
     os.makedirs(out_dir, exist_ok=True)
     paths = []
     for i in range(n):
         p = os.path.join(out_dir, f"2099{(i % 28) + 1:04d}_syn_{seed0 + i}.npz")
-        make_synthetic_tape(seed0 + i, trend_every_s=trend_every_s).save(p)
+        tape = make_bounce_tape(seed0 + i) if kind == "bounce" else make_synthetic_tape(seed0 + i, trend_every_s=trend_every_s)
+        tape.save(p)
         paths.append(p)
     return paths
 

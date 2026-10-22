@@ -64,6 +64,11 @@ class ExchangeConfig:
     # In the two optimistic modes a new order can also be filled by trades in the
     # same half-second it goes live, and cancels are applied before fills.
     fill_mode: str = "realistic"
+    # Pessimistic-fill stress (P17): the queue ahead of a resting order is this multiple of the size shown
+    # (also when it is capped by what is still shown), and only this fraction of the volume traded at /
+    # through our price counts towards filling it. 1.0 / 1.0 = the normal model.
+    queue_mult: float = 1.0
+    trade_fill_frac: float = 1.0
 
 
 @dataclass
@@ -288,7 +293,7 @@ class Exchange:
             return
         hit = np.nonzero(ticks == o.tick)[0]
         if len(hit):
-            o.queue_ahead = float(sizes[hit[0]])
+            o.queue_ahead = float(sizes[hit[0]]) * self.cfg.queue_mult
         elif len(ticks) and ((o.side == BACK and o.tick > ticks[-1]) or (o.side == LAY and o.tick < ticks[-1])):
             o.queue_ahead = 1e9  # deeper than the visible ladder: treat as unreachable
         else:
@@ -302,7 +307,7 @@ class Exchange:
                 continue
             sel = tr_r == o.runner
             if sel.any():
-                tt, vv = tr_t[sel], tr_v[sel].astype(np.float64)
+                tt, vv = tr_t[sel], tr_v[sel].astype(np.float64) * self.cfg.trade_fill_frac
                 through = float(vv[(tt > o.tick) if o.side == BACK else (tt < o.tick)].sum())
                 at = float(vv[tt == o.tick].sum())
                 burn = min(o.queue_ahead, at)
@@ -319,7 +324,7 @@ class Exchange:
             ticks, sizes = self._levels(self.step, o.runner, book)
             hit = np.nonzero(ticks == o.tick)[0]
             if len(hit):
-                o.queue_ahead = min(o.queue_ahead, float(sizes[hit[0]]))
+                o.queue_ahead = min(o.queue_ahead, float(sizes[hit[0]]) * self.cfg.queue_mult)
             elif o.queue_ahead < 1e9:
                 o.queue_ahead = 0.0
             # historical book crossed our resting price -> we'd have been matched

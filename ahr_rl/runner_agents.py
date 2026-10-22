@@ -116,29 +116,31 @@ class RunnerAgentEnv(ContinuousAllocEnv):
 
 # ============================================================================ networks
 class RunnerActor(nn.Module):
-    """Per-runner squashed Gaussian over (c, s), with the market seen through attention."""
+    """Per-runner squashed Gaussian over n_act actions, with the market seen through attention.
+    Action 0 (conviction) is in [-1, 1]; the others (size, and P17's price offset) are in [0, 1]."""
 
-    def __init__(self, d=64, layers=2, runner_extra=0, size_bias=-1.5, init_log_std=-0.5):
+    def __init__(self, d=64, layers=2, runner_extra=0, size_bias=-1.5, init_log_std=-0.5, n_act=N_ACT):
         super().__init__()
+        self.n_act = n_act
         self.bb = Backbone(d, layers, runner_extra=runner_extra)
-        self.head = nn.Linear(2 * d, 2 * N_ACT)
+        self.head = nn.Linear(2 * d, 2 * n_act)
         with torch.no_grad():
             self.head.weight.mul_(0.01)
             self.head.bias.zero_()
             self.head.bias[1] = size_bias  # start small: s ~ 0.05
-            self.head.bias[N_ACT:] = init_log_std
+            self.head.bias[n_act:] = init_log_std
 
     def forward(self, runners, glob, mask):
         hm, hr = self.bb(runners, glob, mask)
-        o = self.head(torch.cat([hr, hm[:, None].expand_as(hr)], -1))  # [B, R, 4]
-        return o[..., :N_ACT], o[..., N_ACT:].clamp(LOG_STD_MIN, LOG_STD_MAX)
+        o = self.head(torch.cat([hr, hm[:, None].expand_as(hr)], -1))  # [B, R, 2 * n_act]
+        return o[..., :self.n_act], o[..., self.n_act:].clamp(LOG_STD_MIN, LOG_STD_MAX)
 
     def sample(self, runners, glob, mask, act_mask, deterministic=False):
-        """-> pre-tanh u, action [B, R, 2] (zero where act_mask is 0), log pi per runner [B, R]."""
+        """-> pre-tanh u, action [B, R, n_act] (zero where act_mask is 0), log pi per runner [B, R]."""
         mu, log_std = self(runners, glob, mask)
         u = mu if deterministic else mu + log_std.exp() * torch.randn_like(mu)
         a = torch.tanh(u)
-        a = torch.stack([a[..., 0], (a[..., 1] + 1) / 2], -1) * act_mask[..., None]
+        a = torch.cat([a[..., :1], (a[..., 1:] + 1) / 2], -1) * act_mask[..., None]
         lp = -0.5 * ((u - mu) / log_std.exp()) ** 2 - log_std - 0.5 * math.log(2 * math.pi)
         lp = lp - 2 * (math.log(2) - u - Fn.softplus(-2 * u))
         return u, a, lp.sum(-1)
@@ -147,10 +149,10 @@ class RunnerActor(nn.Module):
 class RunnerCritic(nn.Module):
     """Q_r(s, a_r) for every runner at once; runner r's value sees only its own action."""
 
-    def __init__(self, d=64, layers=2, runner_extra=0):
+    def __init__(self, d=64, layers=2, runner_extra=0, n_act=N_ACT):
         super().__init__()
         self.bb = Backbone(d, layers, runner_extra=runner_extra)
-        self.out = nn.Sequential(nn.Linear(2 * d + N_ACT, d), nn.GELU(), nn.Linear(d, 1))
+        self.out = nn.Sequential(nn.Linear(2 * d + n_act, d), nn.GELU(), nn.Linear(d, 1))
 
     def forward(self, runners, glob, mask, act):
         hm, hr = self.bb(runners, glob, mask)
@@ -158,9 +160,9 @@ class RunnerCritic(nn.Module):
 
 
 def flat_action(a) -> np.ndarray:
-    """[.., R, 2] -> [.., 48] (all convictions, then all sizes)."""
+    """[.., R, n_act] -> [.., R * n_act]: all runners' action 0, then all action 1, ..."""
     a = np.asarray(a)
-    return np.concatenate([a[..., 0], a[..., 1]], -1).astype(np.float32)
+    return np.concatenate([a[..., i] for i in range(a.shape[-1])], -1).astype(np.float32)
 
 
 def make_runner_policy(actor, device="cpu"):
@@ -191,7 +193,7 @@ def random_runner_policy(size: float = 0.25, seed: int = 0):
 def load_runner_actor(path: str, device: str):
     ck = torch.load(path, map_location=device, weights_only=False)
     ar = ck["args"]
-    actor = RunnerActor(ar["d_model"], ar["n_layers"], ar.get("runner_extra", 0)).to(device)
+    actor = RunnerActor(ar["d_model"], ar["n_layers"], ar.get("runner_extra", 0), n_act=ar.get("n_act", N_ACT)).to(device)
     actor.load_state_dict(ck["actor"])
     actor.eval()
     return actor
@@ -202,26 +204,27 @@ def train(tapes_glob: str, out: str, cfg: RunnerAgentConfig, steps: int, warmup:
           device: str, buffer: int = 400_000, batch: int = 256, update_every: int = 2, grad_steps: int = 1,
           lr: float = 3e-4, gamma: float = 0.995, tau: float = 0.005, init_alpha: float = 0.05,
           target_entropy_per_dim: float = 1.0, d_model: int = 64, n_layers: int = 2, eval_races: int = 100,
-          warmup_mode: str = "mixed") -> str:
+          warmup_mode: str = "mixed", env_cls=None, n_act: int = N_ACT) -> str:
     """Independent-learner SAC with shared weights. Returns the path of the VAL-best checkpoint."""
     torch.manual_seed(seed)
     np.random.seed(seed)
     os.makedirs(out, exist_ok=True)
     tr, va, te = split_by_date(list_tapes(tapes_glob))
     json.dump({"train": tr, "val": va, "test": te}, open(os.path.join(out, "split.json"), "w"), indent=1)
+    env_cls = env_cls or RunnerAgentEnv
     tcfg = replace(cfg, random_start_s=30.0)
-    fns = [(lambda i=i: RunnerAgentEnv(tr, tcfg, seed=seed + i)) for i in range(n_envs)]
+    fns = [(lambda i=i: env_cls(tr, tcfg, seed=seed + i)) for i in range(n_envs)]
     venv = gym.vector.AsyncVectorEnv(fns, autoreset_mode=gym.vector.AutoresetMode.SAME_STEP)
     dev = torch.device(device)
     obs, _ = venv.reset(seed=seed)
     N, R, F = obs["runners"].shape
     G = obs["global"].shape[1]
     extra = F - N_RUNNER_FEATURES
-    args = dict(d_model=d_model, n_layers=n_layers, runner_extra=extra, steps=steps, warmup=warmup, seed=seed,
-                env=asdict(cfg))
+    args = dict(d_model=d_model, n_layers=n_layers, runner_extra=extra, n_act=n_act, steps=steps, warmup=warmup,
+                seed=seed, env=asdict(cfg))
     json.dump(args, open(os.path.join(out, "config.json"), "w"), indent=1, default=str)
-    actor = RunnerActor(d_model, n_layers, extra).to(dev)
-    q1, q2, q1t, q2t = (RunnerCritic(d_model, n_layers, extra).to(dev) for _ in range(4))
+    actor = RunnerActor(d_model, n_layers, extra, n_act=n_act).to(dev)
+    q1, q2, q1t, q2t = (RunnerCritic(d_model, n_layers, extra, n_act=n_act).to(dev) for _ in range(4))
     q1t.load_state_dict(q1.state_dict())
     q2t.load_state_dict(q2.state_dict())
     for p in list(q1t.parameters()) + list(q2t.parameters()):
@@ -230,14 +233,14 @@ def train(tapes_glob: str, out: str, cfg: RunnerAgentConfig, steps: int, warmup:
     q_opt = torch.optim.Adam(list(q1.parameters()) + list(q2.parameters()), lr=lr)
     log_alpha = torch.tensor(math.log(init_alpha), device=dev, requires_grad=True)
     al_opt = torch.optim.Adam([log_alpha], lr=lr)
-    tgt_ent = -target_entropy_per_dim * N_ACT
+    tgt_ent = -target_entropy_per_dim * n_act
 
     C = buffer
     B_r, B_r2 = np.zeros((C, R, F), np.float16), np.zeros((C, R, F), np.float16)
     B_g, B_g2 = np.zeros((C, G), np.float32), np.zeros((C, G), np.float32)
     B_m, B_m2 = np.zeros((C, R), np.bool_), np.zeros((C, R), np.bool_)
     B_am, B_am2 = np.zeros((C, R), np.bool_), np.zeros((C, R), np.bool_)
-    B_a = np.zeros((C, R, N_ACT), np.float32)
+    B_a = np.zeros((C, R, n_act), np.float32)
     B_rew = np.zeros((C, R), np.float32)
     B_d = np.zeros(C, np.float32)
     ptr, full = 0, False
@@ -252,9 +255,11 @@ def train(tapes_glob: str, out: str, cfg: RunnerAgentConfig, steps: int, warmup:
         am_np = obs["act_mask"].astype(bool)
         if n_steps < warmup:
             ra = explorer.act(obs)  # convictions (masked) + one wager fraction per env
-            act = np.zeros((N, R, N_ACT), np.float32)
+            act = np.zeros((N, R, n_act), np.float32)
             act[..., 0] = ra[:, :R_MAX]
             act[..., 1] = np.clip(ra[:, -1:] / 0.3, 0, 1) * am_np
+            if n_act > 2:  # further actions (P17's price offset): uniform per runner and step
+                act[..., 2:] = np.random.uniform(0, 1, (N, R, n_act - 2)) * am_np[..., None]
         else:
             with torch.no_grad():
                 _, a, _ = actor.sample(*obs_t(obs, dev), act_mask_t(obs, dev))
@@ -328,7 +333,7 @@ def train(tapes_glob: str, out: str, cfg: RunnerAgentConfig, steps: int, warmup:
         # and would otherwise win "best" whenever every trained checkpoint loses
         if n_steps >= warmup and (it % eval_every == 0 or it == n_iters):
             actor.eval()
-            val = summarise(evaluate(make_runner_policy(actor, dev), va[:eval_races], cfg, env_cls=RunnerAgentEnv))
+            val = summarise(evaluate(make_runner_policy(actor, dev), va[:eval_races], cfg, env_cls=env_cls))
             actor.train()
             ck = {"actor": actor.state_dict(), "args": args, "iter": it, "val": val}
             if val["mean_green_$"] > best:
@@ -353,21 +358,24 @@ def train(tapes_glob: str, out: str, cfg: RunnerAgentConfig, steps: int, warmup:
     return os.path.join(out, "best.pt")
 
 
-def test_block(label, ckpt, test, cfg, device, rows, stress=True):
-    """VAL-picked checkpoint (+ latency stress) -> (policy, agent row, stress row); last checkpoint for info."""
+def test_block(label, ckpt, test, cfg, device, rows, stress=True, env_cls=None, extra_stress=()):
+    """VAL-picked checkpoint (+ latency stress, + any extra (name, cfg) stresses) -> (policy, agent row,
+    [stress rows]); the last checkpoint is scored too, for information."""
+    env_cls = env_cls or RunnerAgentEnv
     pol = make_runner_policy(load_runner_actor(ckpt, device), device)
-    main = dict(run=label, **score("agent", evaluate(pol, test, cfg, env_cls=RunnerAgentEnv)))
+    main = dict(run=label, **score("agent", evaluate(pol, test, cfg, env_cls=env_cls)))
     rows.append(main)
-    slow_row = None
+    stress_rows = []
     if stress:
         slow = replace(cfg, exchange=replace(cfg.exchange, latency_steps=2))
-        slow_row = dict(run=label, **score("agent, 1s latency", evaluate(pol, test, slow, env_cls=RunnerAgentEnv)))
-        rows.append(slow_row)
+        for name, c in (("agent, 1s latency", slow), *extra_stress):
+            stress_rows.append(dict(run=label, **score(name, evaluate(pol, test, c, env_cls=env_cls))))
+            rows.append(stress_rows[-1])
     last = os.path.join(os.path.dirname(ckpt), "last.pt")
     if os.path.exists(last):
         lp = make_runner_policy(load_runner_actor(last, device), device)
-        rows.append(dict(run=label, **score("last checkpoint (info)", evaluate(lp, test, cfg, env_cls=RunnerAgentEnv))))
-    return pol, main, slow_row
+        rows.append(dict(run=label, **score("last checkpoint (info)", evaluate(lp, test, cfg, env_cls=env_cls))))
+    return pol, main, stress_rows
 
 
 def main(argv=None):
@@ -456,8 +464,8 @@ def main(argv=None):
               flush=True)
         ck = train(a.tapes, os.path.join(a.out, f"real_seed{sd}"), cfg, a.steps, int(a.steps * a.warmup_frac), sd,
                    eval_races=a.eval_races, **kw)
-        pols[sd], main_row, slow_row = test_block(f"seed {sd}", ck, te, cfg, a.device, rows)
-        results[sd] = (main_row, slow_row)
+        pols[sd], main_row, stress_rows = test_block(f"seed {sd}", ck, te, cfg, a.device, rows)
+        results[sd] = (main_row, stress_rows[0])
 
     res = pd.DataFrame(rows)
     res.to_csv(os.path.join(a.out, "results.csv"), index=False)

@@ -444,3 +444,56 @@ def test_signal_entry_no_lookahead(tmp_path):
     sa, sb = a[a["t"] < cut - 30].reset_index(drop=True), b[b["t"] < cut - 30].reset_index(drop=True)
     cols = ["sig_book_15", "sig_book_30", "sig_lag_15", "sig_lag_30", "mom_30", "wom"]
     assert len(sa) and np.allclose(sa[cols].to_numpy(), sb[cols].to_numpy(), equal_nan=True)
+
+
+def test_resting_agents():
+    from ahr_rl.exchange import Exchange, ExchangeConfig
+    from ahr_rl.features import R_MAX
+    from ahr_rl.ladder import PRICES
+    from ahr_rl.passive_agents import N_ACT3, RestingAgentConfig, RestingAgentEnv
+    from ahr_rl.synthetic import make_bounce_tape
+
+    t = make_bounce_tape(4)
+    cfg = RestingAgentConfig(min_best_usd=0.0, random_start_s=0.0, order_cap=20.0, size_frac_cap=0.2)
+    env = RestingAgentEnv([t], cfg)
+    env.reset(options={"tape": t})
+    a = np.zeros(N_ACT3 * R_MAX, np.float32)
+    a[0], a[R_MAX], a[2 * R_MAX] = 1.0, 1.0, 0.9  # runner 0: back, full size, rest 3 ticks above best
+    env.step(a)
+    o1 = [o for o in env.ex.orders if o.runner == 0]
+    assert len(o1) == 1 and o1[0].tick == t.back_tick[0, 0, 0] + 3  # decided at step 0
+    # size capped at 20% of the money shown at the best level on its side (or the min stake)
+    assert o1[0].size + o1[0].matched <= max(5.0, 0.2 * 1.5 * 30.0) + 1e-6
+    oid = o1[0].oid
+    env.step(a)  # the same order again (if the book has not moved) keeps its place
+    o2 = [o for o in env.ex.orders if o.runner == 0]
+    if o2 and o2[0].tick == o1[0].tick:
+        assert o2[0].oid == oid
+    # BSP exit: hold a position into the start, it is greened at BSP
+    env2 = RestingAgentEnv([t], cfg)
+    env2.reset(options={"tape": t})
+    env2.ex._add_bet(1, BACK, float(t.bsp[1]) * 1.2, 10.0, passive=True)  # backed 20% above the BSP
+    while True:
+        _, _, done, _, info = env2.step(np.zeros(N_ACT3 * R_MAX, np.float32))
+        if done:
+            break
+    assert abs(env2.ex.W[1] - env2.ex.L[1]) < 1e-6  # flat on runner 1
+    assert np.isclose(info["worst"], 10.0 * 0.2 * (1 - 0.08))  # locked +20% of the stake, less commission
+    # bounce control: crossing to back never beats fair, a back resting at the top does
+    s0 = int(np.argmax(t.back_tick[:, 0, 0] == t.back_tick[:, 0, 0].max()))  # runner 0 at the top of its range
+    assert PRICES[t.back_tick[s0, 0, 0]] <= t.bsp[0] + 1e-9
+    # pessimistic fills: queue x2 and half the traded volume fill less than the normal model
+    filled = {}
+    for name, c in (("normal", ExchangeConfig()), ("pess", ExchangeConfig(queue_mult=2.0, trade_fill_frac=0.5))):
+        ex = Exchange(t, replace_cfg(c), start_step=10)
+        o = ex.submit(2, BACK, int(t.lay_tick[10, 2, 0]), 20.0)
+        for _ in range(400):
+            ex.advance()
+        filled[name] = o.matched
+    assert filled["pess"] <= filled["normal"]
+
+
+def replace_cfg(c):
+    from dataclasses import replace
+
+    return replace(c, bankroll=1e9)

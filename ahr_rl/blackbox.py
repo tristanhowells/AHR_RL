@@ -49,6 +49,7 @@ from .continuous import Actor, make_policy_fn, parse_args as sac_args, train_sac
 from .env import list_tapes, split_by_date
 from .env_continuous import N_CONT, ContinuousAllocEnv, ContinuousConfig
 from .evaluate import evaluate, summarise
+from .exchange import BACK
 from .features import R_MAX
 from .synthetic import write_synthetic
 from .tape import Tape
@@ -154,8 +155,8 @@ def forensics(pol, tapes, cfg, env_cls=ContinuousAllocEnv) -> pd.DataFrame:
             bt, lt = t.back_tick[s, :, 0], t.lay_tick[s, :, 0]
             mid = np.where((bt >= 0) & (lt >= 0), (bt + lt) / 2.0, np.inf)
             rank = int((mid < mid[f.runner]).sum()) + 1
-            rows.append(dict(market=t.name, side="back" if f.side == 0 else "lay", rank=min(rank, 7),
-                             best_usd=float(liq[s, f.runner]),
+            rows.append(dict(market=t.name, side="back" if f.side == BACK else "lay", rank=min(rank, 7),
+                             best_usd=float(liq[s, f.runner]), passive=bool(f.passive),
                              t=float(t.t_rel[s]), stake=f.stake, price=f.price,
                              race_green=float(info.get("worst", np.nan))))
     d = pd.DataFrame(rows)
