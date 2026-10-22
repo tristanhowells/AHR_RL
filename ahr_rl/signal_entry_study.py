@@ -162,47 +162,77 @@ def quintile_table(df: pd.DataFrame, sig: str, side: str, k: int = 1, hold: int 
     rows = []
     for q, d in g.groupby("q_" + sig, observed=True):
         w = d[f"f{hold}"]
+        tr_, ho = d[d["is_train"]], d[~d["is_train"]]
         rows.append({"signal": sig, "side": side, "quintile": q, "attempts": len(d), "races": d["race"].nunique(),
                      f"fill{hold}_%": w.mean() * 100, "ev_if_all_filled_%": d["ev_fill"].mean(),
                      "ev_given_fill_%": float(np.average(d["ev_fill"], weights=w)) if w.sum() > 0 else np.nan,
-                     "ev_attempt_%": d[f"ev_attempt_{hold}"].mean()})
+                     "ev_attempt_%": d[f"ev_attempt_{hold}"].mean(),
+                     "train_ev_attempt_%": tr_[f"ev_attempt_{hold}"].mean(),
+                     "holdout_ev_attempt_%": ho[f"ev_attempt_{hold}"].mean(), "holdout_races": ho["race"].nunique()})
     out = pd.DataFrame(rows)
     if len(out):
         out["adverse_sel_pp"] = out["ev_given_fill_%"] - out["ev_if_all_filled_%"]
     return out
 
 
+def _race_stats(rc: np.ndarray, v: np.ndarray, n_races: int):
+    """Race-clustered mean of per-race means, its t, the race count, and the per-race means."""
+    ssum = np.bincount(rc, v, n_races)
+    cnt = np.bincount(rc, minlength=n_races)
+    m = ssum[cnt > 0] / cnt[cnt > 0]
+    if len(m) < 2:
+        return (float(m.mean()) if len(m) else np.nan), np.nan, len(m), m
+    sd = m.std(ddof=1)
+    return float(m.mean()), (float(m.mean() / (sd / np.sqrt(len(m)))) if sd > 0 else np.nan), len(m), m
+
+
 def rule_search(df: pd.DataFrame, train: pd.Series, cuts: dict, min_races: int, top: int = 15) -> pd.DataFrame:
+    """Every slice scored on TRAIN days (race-level t); the top ones scored once on HOLDOUT.
+    Vectorised: one pass per (side, k) group, per-race sums with bincount."""
+    rc_all, races = pd.factorize(df["race"])
+    n_races = len(races)
+    tr_all = train.to_numpy()
+    liq_all = df["liquid"].to_numpy()
+    fav_all = df["fav_rank"].astype(str).to_numpy()
     res = []
-    # both tails for both sides: the TRAIN orientation (from all runners) can differ within a slice
-    for sig, side, tail, k, h, lq, th, fr in itertools.product(SIGNALS, ("back", "lay"), ("shorten", "drift"),
-                                                               (0, 1, 2, 3), (60, 120), (False, True), THRESH,
-                                                               (None, "fav", "2-3")):
-        if k == 0 and h != 60:
-            continue  # crossing fills at once
-        hi, lo = cuts[(sig, lq, th)]
-        o = df["o_" + sig]
-        m = (df["side"] == side) & (df["k"] == k) & ((o >= hi) if tail == "shorten" else (o <= lo))
-        if lq:
-            m &= df["liquid"]
-        if fr is not None:
-            m &= df["fav_rank"] == fr
-        col = f"ev_attempt_{h}" if k > 0 else "ev_fill"
-        g = df.loc[m & train]
-        if g["race"].nunique() < min_races:
-            continue
-        r_ = rt(g[col], g["race"])
-        res.append(dict(signal=sig, side=side, when=tail, k=k, hold=h, liquid=lq, top=f"{int(th * 100)}%", fav_rank=fr or "all",
-                        train_mean=r_["mean"], train_t=r_["t"], train_races=r_["races"], _m=m, _col=col))
+    for (side, k), idx in df.groupby(["side", "k"]).indices.items():
+        rc, tr, liq, fav = rc_all[idx], tr_all[idx], liq_all[idx], fav_all[idx]
+        evs = {h: df[f"ev_attempt_{h}"].to_numpy()[idx] for h in (60, 120)} if k > 0 else \
+            {60: df["ev_fill"].to_numpy()[idx]}
+        for sig in SIGNALS:
+            o = df["o_" + sig].to_numpy()[idx]
+            # both tails for both sides (the TRAIN orientation can differ within a slice), plus "quiet": the
+            # middle of the signal's range (added after seeing section B: flagged, needs a forward test anyway)
+            for tail, lq, th, fr in itertools.product(("shorten", "drift", "quiet"), (False, True), THRESH,
+                                                      (None, "fav", "2-3")):
+                if tail == "quiet" and th != THRESH[0]:
+                    continue
+                if tail == "quiet":
+                    lo, hi = cuts[(sig, lq, "quiet")]
+                    m = (o >= lo) & (o <= hi)
+                else:
+                    hi, lo = cuts[(sig, lq, th)]
+                    m = (o >= hi) if tail == "shorten" else (o <= lo)
+                if lq:
+                    m &= liq
+                if fr is not None:
+                    m &= fav == fr
+                for h, v in evs.items():
+                    mm = m & np.isfinite(v)
+                    mt = mm & tr
+                    mean, t, R, _ = _race_stats(rc[mt], v[mt], n_races)
+                    if R < min_races:
+                        continue
+                    res.append(dict(signal=sig, side=side, when=tail, k=k, hold=h, liquid=lq,
+                                    top="40-60%" if tail == "quiet" else f"{int(th * 100)}%", fav_rank=fr or "all",
+                                    train_mean=mean, train_t=t, train_races=R, _ho=(rc[mm & ~tr], v[mm & ~tr])))
     res = sorted(res, key=lambda x: -np.nan_to_num(x["train_t"], nan=-99))[:top]
     out = []
     for r in res:
-        g = df.loc[r["_m"] & ~train]
-        ht = rt(g[r["_col"]], g["race"])
-        per = g.groupby("race")[r["_col"]].mean()
-        drop = float(per.drop(per.idxmax()).mean()) if len(per) > 1 else np.nan
-        out.append({k: v for k, v in r.items() if not k.startswith("_")} |
-                   dict(holdout_mean=ht["mean"], holdout_t=ht["t"], holdout_races=ht["races"], holdout_drop_best=drop))
+        rc, v = r.pop("_ho")
+        mean, t, R, per = _race_stats(rc, v, n_races)
+        drop = float(np.delete(per, per.argmax()).mean()) if len(per) > 1 else np.nan  # without its best race
+        out.append(r | dict(holdout_mean=mean, holdout_t=t, holdout_races=R, holdout_drop_best=drop))
     return pd.DataFrame(out)
 
 
@@ -257,6 +287,7 @@ def main(argv=None):
     sig["t"] = sig["t"].astype(np.float32)
     df = df.merge(sig[["race", "runner", "t"] + [f"o_{c}" for c in SIGNALS]], on=["race", "runner", "t"], how="inner")
     train = ~df["day"].isin(hold_days)
+    df["is_train"] = train
     cut = (float(np.nanquantile(df.loc[train & (df["k"] == 0) & (df["t"] >= -300), "best_usd"], 0.8))
            if a.liq_cut == "auto" else float(a.liq_cut))
     df["liquid"] = df["best_usd"] >= cut
@@ -293,17 +324,19 @@ def main(argv=None):
             b = base.loc[train & (base["liquid"] if lq else True), "o_" + c]
             for th in THRESH:
                 cuts[(c, lq, th)] = (float(np.nanquantile(b, 1 - th)), float(np.nanquantile(b, th)))
+            cuts[(c, lq, "quiet")] = (float(np.nanquantile(b, 0.4)), float(np.nanquantile(b, 0.6)))
 
     log("\n=== B. Does the signal shrink adverse selection? Liquid runners, k = 1, hold 60s, by signal quintile ===")
-    log("(Q5 = signal says shorten: good for backs; Q1 = drift: good for lays)")
+    log("(Q5 = signal says shorten: good for backs; Q1 = drift: good for lays; the last columns split the EV per "
+        "attempt into TRAIN and HOLDOUT days)")
     tb = pd.concat([quintile_table(df, c, s) for c in SIGNALS for s in ("back", "lay")], ignore_index=True)
     tb.to_csv(os.path.join(a.out, f"B_quintiles{tag}.csv"), index=False)
     for c in SIGNALS:
         log(f"\n{c}:")
         log(tb[tb["signal"] == c].drop(columns="signal").round(3).to_string(index=False))
 
-    log(f"\n=== C. Rule search (signal x side x k x hold x liquidity x threshold x rank): TRAIN (>= {a.min_races} "
-        f"races) -> HOLDOUT ===")
+    log(f"\n=== C. Rule search (signal x side x tail x k x hold x liquidity x threshold x rank): TRAIN (>= "
+        f"{a.min_races} races) -> HOLDOUT ===")
     rs = rule_search(df, train, cuts, a.min_races)
     rs.to_csv(os.path.join(a.out, f"C_rules{tag}.csv"), index=False)
     log(rs.round(3).to_string(index=False))
