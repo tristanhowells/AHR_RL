@@ -25,8 +25,9 @@ should rest there; a lay should rest at the low end).
      selection, EV per attempt. A useful signal: backs in the top quintile keep more of their
      price improvement than the bottom one.
   C  rule search: signal x side x tail x k x hold x liquidity x threshold (top 20 / 10 / 5%) x rank,
-     picked on TRAIN days (race-level t), scored once on HOLDOUT; "edge" = holdout mean > 0,
-     t > 2, >= 20 races and still > 0 without its best race. A pass is a hypothesis for a
+     picked on TRAIN days (race-level t), scored once on HOLDOUT, each with its baseline (the same
+     slice without the signal) and the within-race lift over it; "edge" = holdout mean > 0, t > 2,
+     >= 20 races, still > 0 without its best race, and a positive holdout lift. A pass is a hypothesis for a
      pre-registered forward test (like P3c), not a result.
 
     python -m ahr_rl.signal_entry_study --tapes "data/tapes/*.npz" --orders runs/passive_entry/orders.parquet \\
@@ -186,9 +187,23 @@ def _race_stats(rc: np.ndarray, v: np.ndarray, n_races: int):
     return float(m.mean()), (float(m.mean() / (sd / np.sqrt(len(m)))) if sd > 0 else np.nan), len(m), m
 
 
+def _lift(rc: np.ndarray, v: np.ndarray, in_rule: np.ndarray, n_races: int):
+    """Within-race lift of the rule over its baseline (the same slice without the signal): per race,
+    mean(rule orders) - mean(all the slice's orders), over races with rule orders; mean, t, races."""
+    s_all, n_all = np.bincount(rc, v, n_races), np.bincount(rc, minlength=n_races)
+    s_r, n_r = np.bincount(rc[in_rule], v[in_rule], n_races), np.bincount(rc[in_rule], minlength=n_races)
+    ok = n_r > 0
+    d = s_r[ok] / n_r[ok] - s_all[ok] / n_all[ok]
+    if len(d) < 2 or d.std(ddof=1) == 0:
+        return (float(d.mean()) if len(d) else np.nan), np.nan
+    return float(d.mean()), float(d.mean() / (d.std(ddof=1) / np.sqrt(len(d))))
+
+
 def rule_search(df: pd.DataFrame, train: pd.Series, cuts: dict, min_races: int, top: int = 15) -> pd.DataFrame:
-    """Every slice scored on TRAIN days (race-level t); the top ones scored once on HOLDOUT.
-    Vectorised: one pass per (side, k) group, per-race sums with bincount."""
+    """Every slice scored on TRAIN days (race-level t); the top ones scored once on HOLDOUT, each with
+    its baseline (same side, k, hold, liquidity and rank, no signal condition) and the within-race lift
+    over it, so a period that favours one side (e.g. HOLDOUT days were better for backs) is not
+    mistaken for the signal. Vectorised: one pass per (side, k) group, per-race sums with bincount."""
     rc_all, races = pd.factorize(df["race"])
     n_races = len(races)
     tr_all = train.to_numpy()
@@ -213,26 +228,38 @@ def rule_search(df: pd.DataFrame, train: pd.Series, cuts: dict, min_races: int, 
                 else:
                     hi, lo = cuts[(sig, lq, th)]
                     m = (o >= hi) if tail == "shorten" else (o <= lo)
+                base = np.ones(len(o), bool)
                 if lq:
-                    m &= liq
+                    base &= liq
                 if fr is not None:
-                    m &= fav == fr
+                    base &= fav == fr
+                m &= base
                 for h, v in evs.items():
-                    mm = m & np.isfinite(v)
+                    fin = np.isfinite(v)
+                    mm = m & fin
                     mt = mm & tr
                     mean, t, R, _ = _race_stats(rc[mt], v[mt], n_races)
                     if R < min_races:
                         continue
+                    bb = base & fin
                     res.append(dict(signal=sig, side=side, when=tail, k=k, hold=h, liquid=lq,
                                     top="40-60%" if tail == "quiet" else f"{int(th * 100)}%", fav_rank=fr or "all",
-                                    train_mean=mean, train_t=t, train_races=R, _ho=(rc[mm & ~tr], v[mm & ~tr])))
+                                    train_mean=mean, train_t=t, train_races=R,
+                                    _sets={"train": (rc[bb & tr], v[bb & tr], mm[bb & tr]),
+                                           "holdout": (rc[bb & ~tr], v[bb & ~tr], mm[bb & ~tr])}))
     res = sorted(res, key=lambda x: -np.nan_to_num(x["train_t"], nan=-99))[:top]
     out = []
     for r in res:
-        rc, v = r.pop("_ho")
-        mean, t, R, per = _race_stats(rc, v, n_races)
-        drop = float(np.delete(per, per.argmax()).mean()) if len(per) > 1 else np.nan  # without its best race
-        out.append(r | dict(holdout_mean=mean, holdout_t=t, holdout_races=R, holdout_drop_best=drop))
+        sets = r.pop("_sets")
+        rec = dict(r)
+        for nm, (rc, v, inr) in sets.items():
+            if nm == "holdout":
+                mean, t, R, per = _race_stats(rc[inr], v[inr], n_races)
+                drop = float(np.delete(per, per.argmax()).mean()) if len(per) > 1 else np.nan  # without its best race
+                rec |= dict(holdout_mean=mean, holdout_t=t, holdout_races=R, holdout_drop_best=drop)
+            rec[f"{nm}_baseline"] = _race_stats(rc, v, n_races)[0]
+            rec[f"{nm}_lift"], rec[f"{nm}_lift_t"] = _lift(rc, v, inr, n_races)
+        out.append(rec)
     return pd.DataFrame(out)
 
 
@@ -339,12 +366,17 @@ def main(argv=None):
         f"{a.min_races} races) -> HOLDOUT ===")
     rs = rule_search(df, train, cuts, a.min_races)
     rs.to_csv(os.path.join(a.out, f"C_rules{tag}.csv"), index=False)
-    log(rs.round(3).to_string(index=False))
+    log(rs[["signal", "side", "when", "k", "hold", "liquid", "top", "fav_rank", "train_mean", "train_t", "train_races",
+            "holdout_mean", "holdout_t", "holdout_races", "holdout_drop_best"]].round(3).to_string(index=False))
+    log("\nthe same rules against their baseline (same slice, no signal condition): the within-race lift is what the "
+        "signal adds; the baseline is what the slice earned anyway on those days")
+    log(rs[["signal", "side", "when", "k", "hold", "top", "fav_rank", "train_baseline", "train_lift", "train_lift_t",
+            "holdout_baseline", "holdout_lift", "holdout_lift_t"]].round(3).to_string(index=False))
     best = rs.iloc[0].to_dict() if len(rs) else {}
     edge = bool(best) and best["holdout_mean"] > 0 and (best["holdout_t"] or 0) > 2 and \
-        best["holdout_races"] >= 20 and best["holdout_drop_best"] > 0
-    log("EDGE: the best TRAIN rule holds up on HOLDOUT -> pre-register it and forward-test it like P3c" if edge else
-        "NO EDGE: the best TRAIN rule does not hold up on HOLDOUT")
+        best["holdout_races"] >= 20 and best["holdout_drop_best"] > 0 and best["holdout_lift"] > 0
+    log("EDGE: the best TRAIN rule holds up on HOLDOUT and beats its baseline -> pre-register it and forward-test it "
+        "like P3c" if edge else "NO EDGE: the best TRAIN rule does not hold up on HOLDOUT (or does not beat its baseline)")
     verdict = dict(liq_cut=cut, edge=edge, best_rule=best, orientation=info,
                    note="rule search over many slices: a pass is a hypothesis for a forward test")
     json.dump(verdict, open(os.path.join(a.out, f"verdict{tag}.json"), "w"), indent=1, default=float)
