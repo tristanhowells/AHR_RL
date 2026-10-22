@@ -188,7 +188,7 @@ def main(argv=None):
     df = pd.DataFrame(rows)
     if df.empty:
         raise SystemExit("no events")
-    df["hit_tp"] = df["hit_tp"].fillna(False).astype(bool)
+    df["hit_tp"] = df["hit_tp"].astype("boolean").fillna(False).astype(bool)  # None = no fill
     df.to_parquet(os.path.join(a.out, "attempts.parquet"), index=False)
     df["forward"] = df["day"] >= a.since
     info = race_filter.race_info(paths, a.catalogues, a.races_csv).set_index("race")
