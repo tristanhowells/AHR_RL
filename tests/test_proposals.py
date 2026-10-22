@@ -390,3 +390,35 @@ def test_crossmatch_virtual():
     assert (_virtual(tick, size, live, True)[0] == -1).all()
     live[0, 2] = False  # ... unless that runner is no longer live
     assert (_virtual(tick, size, live, True)[0][0, :2] >= 0).all()
+
+
+def test_passive_entry_fills_match_exchange():
+    from ahr_rl.exchange import LAY, Exchange, ExchangeConfig
+    from ahr_rl.ladder import PRICES
+    from ahr_rl.passive_entry_study import ev_back, ev_lay, queue_fills, sim_order
+
+    # queue: 10 ahead, 4 traded at our price, then 8 -> the queue is gone and 2 fill us
+    assert np.allclose(queue_fills(10.0, np.array([20, 20, 20.]), np.array([4, 8, 0.]), np.zeros(3)), [0, 2, 0])
+    # green at BSP: back 4.0 vs BSP 3.0 = +1/3 less commission; lay is the mirror image per $ of liability
+    assert np.isclose(ev_back(4.0, 3.0, 0.1), (4 / 3 - 1) * 0.9) and np.isclose(ev_back(3.0, 4.0, 0.1), 3 / 4 - 1)
+    assert np.isclose(ev_lay(3.0, 4.0, 0.0), (1 - 3 / 4) / 2)
+    # the step-by-step replay gives the same fills as the exchange engine (cross-matching off)
+    t = make_synthetic_tape(3)
+    rng = np.random.default_rng(0)
+    for _ in range(25):
+        r, s0 = int(rng.integers(0, 6)), int(rng.integers(10, t.n_steps - 300))
+        back = bool(rng.integers(0, 2))
+        bb, bl = int(t.back_tick[s0, r, 0]), int(t.lay_tick[s0, r, 0])
+        k = int(rng.integers(1, 4))
+        P = bb + k if back else bl - k
+        size = 10.0 if back else float(np.floor(10.0 / (PRICES[P] - 1) * 100) / 100)
+        s1, end = s0 + 1, s0 + 240
+        m = (t.trade_runner == r) & (t.trade_step > s1) & (t.trade_step <= end)
+        cum, _ = sim_order(t, r, "back" if back else "lay", P, size, s1, end, t.trade_step[m],
+                           t.trade_tick[m].astype(np.int32), t.trade_vol[m].astype(np.float64),
+                           np.zeros(end - s1 + 1), 10.0 / t.dt)
+        ex = Exchange(t, ExchangeConfig(bankroll=1e9, min_stake=0.0), start_step=s0)
+        o = ex.submit(r, BACK if back else LAY, P, size)
+        while ex.step < end:
+            ex.advance()
+        assert abs(min(cum[-1], size) - o.matched) < 1e-6, (r, s0, back, k, cum[-1], o.matched)
