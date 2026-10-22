@@ -422,3 +422,25 @@ def test_passive_entry_fills_match_exchange():
         while ex.step < end:
             ex.advance()
         assert abs(min(cum[-1], size) - o.matched) < 1e-6, (r, s0, back, k, cum[-1], o.matched)
+
+
+def test_signal_entry_no_lookahead(tmp_path):
+    from ahr_rl.signal_entry_study import signal_rows
+
+    t = make_synthetic_tape(5)
+    t.went_in_play = True
+    p1 = str(tmp_path / "20260901_1200_Test_1_1.npz")
+    t.save(p1)
+    a = signal_rows(p1, every_s=20.0, last_s=600.0)
+    assert a is not None and {"sig_book_30", "sig_lag_15", "mom_30", "wom", "fwd_30"} <= set(a.columns)
+    # change the book after the 400th step: signals at decision times before it must not move
+    t.back_tick[400:] = np.clip(t.back_tick[400:] + 3, 0, None)
+    t.lay_tick[400:] = np.clip(t.lay_tick[400:] + 3, 0, None)
+    t.back_size[400:] *= 2.0
+    p2 = str(tmp_path / "20260901_1200_Test_1_2.npz")
+    t.save(p2)
+    b = signal_rows(p2, every_s=20.0, last_s=600.0)
+    cut = float(t.t_rel[399])
+    sa, sb = a[a["t"] < cut - 30].reset_index(drop=True), b[b["t"] < cut - 30].reset_index(drop=True)
+    cols = ["sig_book_15", "sig_book_30", "sig_lag_15", "sig_lag_30", "mom_30", "wom"]
+    assert len(sa) and np.allclose(sa[cols].to_numpy(), sb[cols].to_numpy(), equal_nan=True)
