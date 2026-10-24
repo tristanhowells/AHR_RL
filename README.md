@@ -154,6 +154,7 @@ python -m ahr_rl.report --run runs/ppo_v2            # writes gate.json
 | `top_races.py` | P18: pure black box on the N highest-volume races (scanned from the tapes): P17's per-runner agents, full menu, no gate / signals / BSP exit, objective green at the off; k-fold cross-validated (every race scored once out of sample), memorisation gap, stresses; resumable |
 | `arm_c_forward.py` | P3c arm C (registered 2026-10-24): forward test of P16's drift-fade resting back (2nd-3rd favourites after a bottom-10% 30s drift, rest 3 ticks above best, exit at BSP), frozen cut from pre-2026-10-05 days, decided in races |
 | `market_select.py` | Training markets by size ($ matched at the off): `--min-matched` for P17 / P18 |
+| `winrate_agents.py` | P19: black box whose objective is a profit more often than not after the race (positions held to the result; reward = BSP-implied P(profit) - P(loss), optionally + EV), with win-rate-trap diagnostics (EV, avg win vs loss, a lay-band reference) |
 | `strategy_search.py` | Black box, part 2: random search + mutation over whole rule-based strategies, positive control, scored once on TEST with a latency stress |
 | `day_study.py` | Beyond green-before-the-off: in-play resting orders (low lays / drift backs) and what earlier races at a meeting reveal (barrier, jockey, trainer, favourites), bets to the result |
 | `race_filter.py` | Shared `--race-type {all,flat,harness}` / `--metro-only` filter (from catalogues, tape catalogue features or the race study's races.csv) used by P3b, P6, P7 and P9 |

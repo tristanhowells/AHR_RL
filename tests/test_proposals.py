@@ -535,3 +535,35 @@ def test_arm_c_frozen_rule():
     if att is not None:  # only 2nd-3rd favourites below the cut, backs 3 ticks above the best back price
         assert att["rank"].isin([2, 3]).all() and (att["mom_30"] <= cut + 1e-9).all()
         assert att["filled"].between(0, 1).all()
+
+
+def test_winrate_hold_env():
+    from ahr_rl.features import R_MAX
+    from ahr_rl.ladder import PRICES
+    from ahr_rl.passive_agents import N_ACT3
+    from ahr_rl.synthetic import make_bounce_tape
+    from ahr_rl.winrate_agents import HoldConfig, HoldEnv, lay_band_policy
+
+    t = make_bounce_tape(5)
+    env = HoldEnv([t], HoldConfig(min_best_usd=0.0, random_start_s=0.0))
+    env.reset(options={"tape": t})
+    p = float(t.bsp[2]) * 1.1
+    env.ex._add_bet(2, BACK, p, 10.0, passive=True)  # back runner 2 above its BSP and hold it
+    while True:
+        _, reward, done, _, info = env.step(np.zeros(N_ACT3 * R_MAX, np.float32))
+        if done:
+            break
+    assert env.ex.W[2] > 0 > env.ex.L[2]  # never greened: still a straight back at the result
+    pi = (1 / t.bsp) / (1 / t.bsp).sum()
+    assert np.isclose(info["p_profit"], pi[2]) and np.isclose(info["p_loss"], 1 - pi[2])
+    ev = pi[2] * 10 * (p - 1) * (1 - 0.08) - (1 - pi[2]) * 10
+    assert np.isclose(info["ev_bsp"], ev, atol=1e-6)
+    assert np.isclose(reward, pi[2] - (1 - pi[2])) and info["runner_rewards"][2] == reward
+    assert info["runner_rewards"][[0, 1, 3, 4, 5]].sum() == 0  # only the traded runner shares the result
+    # the trap reference lays only runners priced inside its band
+    env2 = HoldEnv([t], HoldConfig(min_best_usd=0.0, random_start_s=0.0))
+    o, _ = env2.reset(options={"tape": t})
+    a = lay_band_policy(3.0, 5.0)(o, env2)
+    for r in range(t.n_runners):
+        bl = PRICES[env2.ex.best(0, r)[1]]
+        assert (a[r] < 0) == (3.0 <= bl <= 5.0)

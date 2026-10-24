@@ -204,9 +204,10 @@ def train(tapes_glob: str, out: str, cfg: RunnerAgentConfig, steps: int, warmup:
           device: str, buffer: int = 400_000, batch: int = 256, update_every: int = 2, grad_steps: int = 1,
           lr: float = 3e-4, gamma: float = 0.995, tau: float = 0.005, init_alpha: float = 0.05,
           target_entropy_per_dim: float = 1.0, d_model: int = 64, n_layers: int = 2, eval_races: int = 100,
-          warmup_mode: str = "mixed", env_cls=None, n_act: int = N_ACT, split=None) -> str:
+          warmup_mode: str = "mixed", env_cls=None, n_act: int = N_ACT, split=None, val_score=None) -> str:
     """Independent-learner SAC with shared weights. Returns the path of the VAL-best checkpoint.
-    split: optional (train, val, test) lists of tape paths instead of the chronological split of tapes_glob."""
+    split: optional (train, val, test) lists of tape paths instead of the chronological split of tapes_glob.
+    val_score: optional f(policy, val_tapes, cfg) -> float for picking the checkpoint (default: mean green $)."""
     torch.manual_seed(seed)
     np.random.seed(seed)
     os.makedirs(out, exist_ok=True)
@@ -334,7 +335,10 @@ def train(tapes_glob: str, out: str, cfg: RunnerAgentConfig, steps: int, warmup:
         # and would otherwise win "best" whenever every trained checkpoint loses
         if n_steps >= warmup and (it % eval_every == 0 or it == n_iters):
             actor.eval()
-            val = summarise(evaluate(make_runner_policy(actor, dev), va[:eval_races], cfg, env_cls=env_cls))
+            pol_ = make_runner_policy(actor, dev)
+            val = summarise(evaluate(pol_, va[:eval_races], cfg, env_cls=env_cls))
+            if val_score is not None:  # the objective's own score picks the checkpoint
+                val["mean_green_$"] = float(val_score(pol_, va[:eval_races], cfg))
             actor.train()
             ck = {"actor": actor.state_dict(), "args": args, "iter": it, "val": val}
             if val["mean_green_$"] > best:
