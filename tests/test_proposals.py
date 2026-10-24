@@ -514,3 +514,24 @@ def test_top_races_selection_and_folds(tmp_path):
     f = folds_of([f"2026090{i}" for i in range(1, 10)] + ["20260910"], 5)
     assert len(f) == 5 and sum(len(x) for x in f) == 10 and f[0] == ["20260901", "20260902"]
     assert len({r for x in f for r in x}) == 10  # every race in exactly one fold
+
+
+def test_arm_c_frozen_rule():
+    from ahr_rl.arm_c_forward import ARM_C, decide, tape_rows
+
+    assert ARM_C["registered"] == "20261024" and ARM_C["since"] == "20261025" and ARM_C["k"] == 3  # frozen
+    s = dict(attempts=1000, races=100, ev_per_attempt_pct=0.5, t=2.5)
+    assert decide(s) == "PASS" and decide(s | dict(t=1.0)) == "CONTINUE" and decide(s | dict(races=200, t=1.0)) == "FAIL"
+    assert decide(s | dict(ev_per_attempt_pct=-0.1)) == "FAIL" and decide(s | dict(races=40)) == "CONTINUE"
+    t = make_synthetic_tape(2)
+    t.bsp = np.full(t.n_runners, 6.0, np.float32)
+    import tempfile, os
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "20261026_1200_Test_1_1.npz")
+        t.save(p)
+        moms, _ = tape_rows(p, None)
+        cut = float(np.quantile(moms["mom_30"], 0.10))
+        _, att = tape_rows(p, cut)
+    if att is not None:  # only 2nd-3rd favourites below the cut, backs 3 ticks above the best back price
+        assert att["rank"].isin([2, 3]).all() and (att["mom_30"] <= cut + 1e-9).all()
+        assert att["filled"].between(0, 1).all()
