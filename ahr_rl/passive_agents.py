@@ -28,6 +28,9 @@ Credibility checks, because resting orders are where the simulator is weakest:
      -0.2% .. +0.8% per attempt). A return per $ traded far above that is more likely a
      simulator artefact than a discovery; it is flagged.
 
+--min-matched (e.g. 20000) restricts training, checkpoint selection and the test to races with at least that
+much matched at the off (P18's market-size scan); the chronological split is then over those races.
+
     python -m ahr_rl.passive_agents --tapes "data/tapes/*.npz" --out runs/passive_agents --min-best-usd auto
 """
 from __future__ import annotations
@@ -50,6 +53,7 @@ from .evaluate import evaluate
 from .exchange import BACK, LAY
 from .features import R_MAX
 from .ladder import N_TICKS, PRICES
+from .market_select import select_markets
 from .runner_agents import MIN_SIZE, RunnerAgentConfig, test_block, train
 from .synthetic import write_synthetic
 
@@ -187,6 +191,9 @@ def main(argv=None):
     ap.add_argument("--runner-cap", type=float, default=50.0)
     ap.add_argument("--market-cap", type=float, default=150.0)
     ap.add_argument("--size-frac-cap", type=float, default=0.2, help="order <= this x money shown at the best level")
+    ap.add_argument("--min-matched", type=float, default=0.0,
+                    help="train / select / test only on races with >= this $ matched at the off (e.g. 20000); 0 = all")
+    ap.add_argument("--workers", type=int, default=os.cpu_count() or 2, help="for scanning market sizes")
     ap.add_argument("--steps", type=int, default=600_000)
     ap.add_argument("--warmup-frac", type=float, default=0.4)
     ap.add_argument("--seeds", default="0,1")
@@ -210,7 +217,12 @@ def main(argv=None):
         print("WARNING: no GPU. Training will be very slow (P13 on CPU: ~12h per seed). Use a GPU runtime.", flush=True)
         torch.set_num_threads(max(1, (os.cpu_count() or 2) - a.n_envs))  # leave cores for the env processes
     tapes = list_tapes(a.tapes)
-    tr, _, te = split_by_date(tapes)
+    if a.min_matched > 0:
+        n_all = len(tapes)
+        tapes = select_markets(tapes, a.min_matched, a.workers)
+        print(f"markets: {len(tapes)} of {n_all} races have >= ${a.min_matched:,.0f} matched at the off "
+              f"({len({os.path.basename(p)[:8] for p in tapes})} race days)", flush=True)
+    tr, va, te = split_by_date(tapes)
     cut = liquidity_cut(tr) if a.min_best_usd == "auto" else float(a.min_best_usd)
     cfg = RestingAgentConfig(random_start_s=0.0, decision_every=a.decision_every, min_best_usd=cut,
                              gate_inputs=not a.no_gate_inputs, order_cap=a.order_cap, runner_cap=a.runner_cap,
@@ -261,7 +273,7 @@ def main(argv=None):
         print(f"\n--- seed {sd}: {a.steps} steps, first {int(a.steps * a.warmup_frac)} on random strategies ---",
               flush=True)
         ck = train(a.tapes, os.path.join(a.out, f"real_seed{sd}"), cfg, a.steps, int(a.steps * a.warmup_frac), sd,
-                   eval_races=a.eval_races, **kw)
+                   eval_races=a.eval_races, split=(tr, va, te), **kw)
         pols[sd], main_row, stress_rows = test_block(f"seed {sd}", ck, te, cfg, a.device, rows,
                                                      env_cls=RestingAgentEnv, extra_stress=extra)
         results[sd] = (main_row, *stress_rows)

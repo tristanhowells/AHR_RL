@@ -20,6 +20,9 @@ the races (in date order) are cut into --folds folds; each fold trains on the ot
 race gets exactly one out-of-sample score; they are pooled. Each fold's checkpoint is also scored
 on its own training races: the gap between the two is how much it memorised.
 
+With --min-matched (e.g. 20000: every race with at least $20k matched, ~25% of races, ~57 a week) there are enough
+races and race days for the usual chronological train / val / test split; that replaces the cross-validation.
+
 Read the result for what it is: an out-of-sample mean over 10 races has a huge error bar, and a
 black box with this much freedom on this little data mostly learns the training races. It shows
 what the agent does in the deepest markets and whether anything carries over; it cannot prove an
@@ -31,51 +34,24 @@ from __future__ import annotations
 
 import argparse
 import json
-import multiprocessing as mp
 import os
 import time
-from concurrent.futures import ProcessPoolExecutor
 from dataclasses import replace
 
 import numpy as np
 import pandas as pd
 import torch
 
-from .blackbox import forensics, race_t, score
-from .env import list_tapes
+from .blackbox import forensics, race_t
+from .env import list_tapes, split_by_date
 from .evaluate import evaluate
+from .market_select import market_sizes
 from .passive_agents import N_ACT3, RestingAgentConfig, RestingAgentEnv, noop_policy, random_policy
 from .runner_agents import load_runner_actor, make_runner_policy, train
-from .tape import Tape
-
-
-def matched_at_off(path: str):
-    """(path, $ matched at the scheduled start, venue/name) - the tape's market total, single-counted."""
-    try:
-        t = Tape.load(path)
-    except Exception:
-        return path, np.nan
-    if not t.went_in_play:
-        return path, np.nan
-    after = np.where(t.t_rel >= 0)[0]
-    s = int(after[0]) if len(after) else t.n_steps - 1
-    return path, float(np.nanmax(t.total_matched[: s + 1])) if s >= 0 else np.nan
 
 
 def top_races(paths, n: int, workers: int, races_csv: str | None = None) -> pd.DataFrame:
-    if races_csv and os.path.exists(races_csv):
-        r = pd.read_csv(races_csv, usecols=["race", "matched_$"])
-        stem = {os.path.basename(p).split(".npz")[0]: p for p in paths}
-        r = r[r["race"].isin(stem)]
-        r["path"] = r["race"].map(stem)
-        d = r.rename(columns={"matched_$": "matched"})[["race", "path", "matched"]]
-    else:
-        os.environ["OMP_NUM_THREADS"] = "1"
-        with ProcessPoolExecutor(workers, mp_context=mp.get_context("spawn")) as pool:
-            res = list(pool.map(matched_at_off, paths, chunksize=8))
-        d = pd.DataFrame(res, columns=["path", "matched"])
-        d["race"] = d["path"].map(lambda p: os.path.basename(p).split(".npz")[0])
-    return d.dropna().sort_values("matched", ascending=False).head(n).reset_index(drop=True)
+    return market_sizes(paths, workers, races_csv).head(n).reset_index(drop=True)
 
 
 def folds_of(races: list[str], k: int) -> list[list[str]]:
@@ -89,6 +65,10 @@ def main(argv=None):
     ap.add_argument("--tapes", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--top", type=int, default=10, help="how many of the highest-volume races")
+    ap.add_argument("--min-matched", type=float, default=0.0,
+                    help="instead of --top: every race with >= this $ matched at the off, and a chronological "
+                         "train / val / test split instead of cross-validation (e.g. 20000)")
+    ap.add_argument("--eval-races", type=int, default=50, help="--min-matched: VAL races for checkpoint selection")
     ap.add_argument("--races-csv", default=None, help="race study races.csv (matched_$); default: scan the tapes")
     ap.add_argument("--folds", type=int, default=5)
     ap.add_argument("--steps", type=int, default=200_000, help="env steps per fold")
@@ -113,10 +93,16 @@ def main(argv=None):
         print("WARNING: no GPU. Training will be very slow. Use a GPU runtime.", flush=True)
         torch.set_num_threads(max(1, (os.cpu_count() or 2) - a.n_envs))
 
-    top = top_races(list_tapes(a.tapes), a.top, a.workers, a.races_csv)
+    sizes = market_sizes(list_tapes(a.tapes), a.workers, a.races_csv)
+    top = sizes[sizes["matched"] >= a.min_matched] if a.min_matched > 0 else sizes.head(a.top)
+    top = top.reset_index(drop=True)
     top.to_csv(os.path.join(a.out, "races.csv"), index=False)
-    print(f"=== P18: the {len(top)} highest-volume races on file (matched at the off, single-counted) ===")
-    print(top[["race", "matched"]].round(0).to_string(index=False), flush=True)
+    if a.min_matched > 0:
+        print(f"=== P18: {len(top)} races with >= ${a.min_matched:,.0f} matched at the off (of {len(sizes)}), "
+              f"{top['race'].str[:8].nunique()} race days ===", flush=True)
+    else:
+        print(f"=== P18: the {len(top)} highest-volume races on file (matched at the off, single-counted) ===")
+        print(top[["race", "matched"]].round(0).to_string(index=False), flush=True)
     if len(top) < 3:
         raise SystemExit("need at least 3 races")
     path = dict(zip(top["race"], top["path"]))
@@ -128,18 +114,27 @@ def main(argv=None):
     slow = replace(cfg, exchange=replace(cfg.exchange, latency_steps=2))
     print(f"\nper runner every {a.decision_every * 0.5:.0f}s: cross or rest 1-{a.max_offset} ticks better, $5-"
           f"${a.order_cap:.0f} at risk (<= {a.size_frac_cap:.0%} of the money shown); objective: green at the off "
-          f"(open positions greened by crossing from the start); {a.folds}-fold cross-validation, {a.steps} steps per "
-          f"fold ({a.device})\n", flush=True)
+          f"(open positions greened by crossing from the start); "
+          f"{'chronological train / val / test split' if a.min_matched > 0 else f'{a.folds}-fold cross-validation'}, "
+          f"{a.steps} steps per {'run' if a.min_matched > 0 else 'fold'} ({a.device})\n", flush=True)
 
-    folds = folds_of(list(top["race"]), min(a.folds, len(top)))
     races_sorted = sorted(top["race"])
+    if a.min_matched > 0:  # enough races for a proper chronological split: train, pick on VAL, score TEST once
+        trp, vap, tep = split_by_date([path[r] for r in races_sorted])
+        stem = lambda p: os.path.basename(p).split(".npz")[0]
+        specs = [([stem(p) for p in trp], [stem(p) for p in vap], [stem(p) for p in tep])]
+        n_val = a.eval_races
+    else:
+        specs = []
+        for test in folds_of(races_sorted, min(a.folds, len(top))):
+            rest = [r for r in races_sorted if r not in test]
+            specs.append(([r for r in rest[:-1]], [rest[-1]], test))  # the latest non-test race picks the checkpoint
+        n_val = 1
     rows, fz_all = [], []
-    for i, test in enumerate(folds):
-        rest = [r for r in races_sorted if r not in test]
-        val = [rest[-1]]  # the latest non-test race picks the checkpoint
-        trn = [r for r in rest if r not in val]
-        print(f"--- fold {i + 1}/{len(folds)}: train {len(trn)}, val {val[0]}, test {', '.join(test)} ---", flush=True)
-        out = os.path.join(a.out, f"fold{i + 1}")
+    for i, (trn, val, test) in enumerate(specs):
+        print(f"--- {'split' if a.min_matched > 0 else f'fold {i + 1}/{len(specs)}'}: train {len(trn)} races, val "
+              f"{len(val)}, test {len(test)} ({test[0][:8]} .. {test[-1][:8]}) ---", flush=True)
+        out = os.path.join(a.out, "split" if a.min_matched > 0 else f"fold{i + 1}")
         done = os.path.join(out, "per_race.csv")
         if os.path.exists(done):  # resumable: a fold finished in an earlier session is not retrained
             rows += pd.read_csv(done).to_dict(orient="records")
@@ -149,9 +144,11 @@ def main(argv=None):
             continue
         split = ([path[r] for r in trn], [path[r] for r in val], [path[r] for r in test])
         ck = train("", out, cfg, a.steps, int(a.steps * a.warmup_frac), a.seed + i, a.n_envs, a.device,
-                   buffer=a.buffer, eval_races=1, env_cls=RestingAgentEnv, n_act=N_ACT3, split=split)
+                   buffer=a.buffer, eval_races=n_val, env_cls=RestingAgentEnv, n_act=N_ACT3, split=split)
         pol = make_runner_policy(load_runner_actor(ck, a.device), a.device)
         te_paths, tr_paths = split[2], split[0]
+        if len(tr_paths) > 100:  # the memorisation check on an even sample of 100 training races is plenty
+            tr_paths = [tr_paths[j] for j in np.linspace(0, len(tr_paths) - 1, 100).astype(int)]
         for name, pf, c, races_, kind in (("agent", pol, cfg, te_paths, "test"),
                                           ("agent, 1s latency", pol, slow, te_paths, "test"),
                                           ("agent, pessimistic fills", pol, pess, te_paths, "test"),
@@ -177,7 +174,7 @@ def main(argv=None):
                                                  worst_race=("green", "min"), best_race=("green", "max"),
                                                  turnover=("turnover", "mean"))
     summ["t"] = [race_t(res.loc[res["policy"] == p, "green"]) for p in summ.index]
-    print("\n=== Out-of-sample (each race scored once, by the fold that never trained on it); $ per race, $500 bank ===")
+    print("\n=== Out-of-sample (TEST races, each scored once, never trained on); $ per race, $500 bank ===")
     print(summ.round(3).to_string())
     oos = res[res["policy"] == "agent"]
     ins = res[res["policy"] == "agent on its OWN training races"]
