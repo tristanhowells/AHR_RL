@@ -567,3 +567,46 @@ def test_winrate_hold_env():
     for r in range(t.n_runners):
         bl = PRICES[env2.ex.best(0, r)[1]]
         assert (a[r] < 0) == (3.0 <= bl <= 5.0)
+
+
+def test_bracket_agents():
+    from ahr_rl.bracket_agents import N_ACT6, BracketAgentEnv, BracketConfig
+    from ahr_rl.features import R_MAX
+    from ahr_rl.synthetic import make_bounce_tape
+
+    t = make_bounce_tape(6)
+    cfg = BracketConfig(min_best_usd=0.0, random_start_s=0.0, order_cap=20.0)
+    env = BracketAgentEnv([t], cfg)
+    o, _ = env.reset(options={"tape": t})
+    assert o["runners"].shape[1] == env.observation_space["runners"].shape[1]
+    a = np.zeros((N_ACT6, R_MAX), np.float32)
+    a[:, 0] = (1.0, 0.3, 0.0, 0.3, 0.0, 0.0)  # runner 0: back now (cross), hold 60s, no tp / sl
+    total, rewards, closed = 0.0, [], None
+    for i in range(40):
+        o, rew, done, _, info = env.step(a.reshape(-1) if i == 0 else np.zeros(N_ACT6 * R_MAX, np.float32))
+        rewards.append(info["runner_rewards"][0])
+        if 0 in env.br:
+            assert o["runners"][0, -3] == 1 and o["act_mask"][0] == 1  # the live trade is shown and kept online
+        if env.trades and closed is None:
+            closed = i
+        if done:
+            break
+    tr = env.trades[0]
+    assert tr["reason"] == "time" and tr["side"] == "back" and abs(env.ex.W[0] - env.ex.L[0]) < 0.01
+    # no reward until the close, then the realised green (net of commission) / $5, credited once
+    assert all(r == 0 for r in rewards[:closed]) and np.isclose(rewards[closed], tr["green"] / 5.0)
+    assert sum(1 for r in rewards if r != 0) == 1
+    # a held-to-the-off trade is closed at BSP; the drift-fade demo only backs, resting 3 ticks above best
+    env2 = BracketAgentEnv([t], cfg)
+    env2.reset(options={"tape": t})
+    a2 = np.zeros((N_ACT6, R_MAX), np.float32)
+    a2[:, 1] = (1.0, 0.3, 0.9, 0.99, 0.0, 0.0)
+    done = False
+    first = True
+    while not done:
+        _, _, done, _, info = env2.step(a2.reshape(-1) if first else np.zeros(N_ACT6 * R_MAX, np.float32))
+        first = False
+    if env2.trades:
+        assert env2.trades[0]["reason"] in ("bsp", "end") and abs(env2.ex.W[1] - env2.ex.L[1]) < 0.01
+    d = env2.demo_action().reshape(N_ACT6, R_MAX)
+    assert (d[0] >= 0).all() and ((d[0] == 0) | (d[2] == np.float32(0.9))).all()

@@ -204,10 +204,15 @@ def train(tapes_glob: str, out: str, cfg: RunnerAgentConfig, steps: int, warmup:
           device: str, buffer: int = 400_000, batch: int = 256, update_every: int = 2, grad_steps: int = 1,
           lr: float = 3e-4, gamma: float = 0.995, tau: float = 0.005, init_alpha: float = 0.05,
           target_entropy_per_dim: float = 1.0, d_model: int = 64, n_layers: int = 2, eval_races: int = 100,
-          warmup_mode: str = "mixed", env_cls=None, n_act: int = N_ACT, split=None, val_score=None) -> str:
+          warmup_mode: str = "mixed", env_cls=None, n_act: int = N_ACT, split=None, val_score=None,
+          n_step: int = 1, demo_frac: float = 0.0) -> str:
     """Independent-learner SAC with shared weights. Returns the path of the VAL-best checkpoint.
     split: optional (train, val, test) lists of tape paths instead of the chronological split of tapes_glob.
-    val_score: optional f(policy, val_tapes, cfg) -> float for picking the checkpoint (default: mean green $)."""
+    val_score: optional f(policy, val_tapes, cfg) -> float for picking the checkpoint (default: mean green $).
+    n_step: n-step returns (a runner's rewards over the next n decisions, while it stays online, then bootstrap
+            with gamma ** n), so a delayed outcome reaches the decision that caused it in one update.
+    demo_frac: share of WARM-UP episodes played by the env's own demo_action() (a known strategy) instead of
+            random strategies, so the replay buffer holds worked examples from the start."""
     torch.manual_seed(seed)
     np.random.seed(seed)
     os.makedirs(out, exist_ok=True)
@@ -245,7 +250,10 @@ def train(tapes_glob: str, out: str, cfg: RunnerAgentConfig, steps: int, warmup:
     B_a = np.zeros((C, R, n_act), np.float32)
     B_rew = np.zeros((C, R), np.float32)
     B_d = np.zeros(C, np.float32)
+    B_disc = np.full(C, gamma, np.float32)  # bootstrap discount (gamma ** steps covered)
     ptr, full = 0, False
+    pend = [[] for _ in range(N)]  # n-step: per env, the transitions not yet written
+    demo_ep = np.random.random(N) < demo_frac
     rms = RunningMeanStd()
     explorer = RandomStrategies(N, F, G, warmup_mode, 0.3, seed)
     logf = open(os.path.join(out, "train_log.csv"), "w")
@@ -262,6 +270,11 @@ def train(tapes_glob: str, out: str, cfg: RunnerAgentConfig, steps: int, warmup:
             act[..., 1] = np.clip(ra[:, -1:] / 0.3, 0, 1) * am_np
             if n_act > 2:  # further actions (P17's price offset): uniform per runner and step
                 act[..., 2:] = np.random.uniform(0, 1, (N, R, n_act - 2)) * am_np[..., None]
+            if demo_ep.any():  # demonstration episodes: the env's own known strategy
+                demos = venv.call("demo_action")
+                for i in np.nonzero(demo_ep)[0]:
+                    f = np.asarray(demos[i], np.float32)
+                    act[i] = np.stack([f[j * R:(j + 1) * R] for j in range(n_act)], -1)
         else:
             with torch.no_grad():
                 _, a, _ = actor.sample(*obs_t(obs, dev), act_mask_t(obs, dev))
@@ -269,6 +282,8 @@ def train(tapes_glob: str, out: str, cfg: RunnerAgentConfig, steps: int, warmup:
         nobs, _, term, trunc, info = venv.step(flat_action(act))
         done = np.logical_or(term, trunc)
         explorer.episode_done(done)
+        if demo_frac > 0:
+            demo_ep[done] = np.random.random(int(done.sum())) < demo_frac
         rr = np.array(info.get("runner_rewards", np.zeros((N, R_MAX))), np.float32)
         nxt = {k: nobs[k].copy() for k in ("runners", "global", "mask", "act_mask")}
         fin = info.get("final_info")
@@ -284,13 +299,41 @@ def train(tapes_glob: str, out: str, cfg: RunnerAgentConfig, steps: int, warmup:
         if am_np.any():
             rms.update(rr[am_np])
         online.append(am_np.sum(1).mean())
-        for i in range(N):
-            B_r[ptr], B_g[ptr], B_m[ptr], B_am[ptr] = obs["runners"][i], obs["global"][i], obs["mask"][i], am_np[i]
-            B_a[ptr], B_rew[ptr], B_d[ptr] = act[i], rr[i], float(term[i])
-            B_r2[ptr], B_g2[ptr], B_m2[ptr], B_am2[ptr] = (nxt["runners"][i], nxt["global"][i], nxt["mask"][i],
-                                                           nxt["act_mask"][i])
+        def put(o, a_, rew, nx, alive, d, disc):
+            nonlocal ptr, full
+            B_r[ptr], B_g[ptr], B_m[ptr], B_am[ptr] = o
+            B_a[ptr], B_rew[ptr], B_d[ptr], B_disc[ptr] = a_, rew, d, disc
+            B_r2[ptr], B_g2[ptr], B_m2[ptr], B_am2[ptr] = nx[0], nx[1], nx[2], alive
             ptr = (ptr + 1) % C
             full = full or ptr == 0
+
+        for i in range(N):
+            o_i = (obs["runners"][i], obs["global"][i], obs["mask"][i], am_np[i])
+            nx_i = (nxt["runners"][i], nxt["global"][i], nxt["mask"][i])
+            am_next = nxt["act_mask"][i].astype(bool)
+            if n_step <= 1:
+                put(o_i, act[i], rr[i], nx_i, am_next, float(term[i]), gamma)
+                continue
+            pend[i].append((o_i, act[i], rr[i].astype(np.float32), am_next))
+
+            def emit(k, nx, d):
+                """Write pend[i][k] with its rewards up to the end of pend[i]; a runner's sum stops once it goes
+                offline (its act_mask drops), and so does its bootstrap."""
+                o0, a0, _, _ = pend[i][k]
+                ret, alive, disc = np.zeros(R, np.float32), np.ones(R, bool), 1.0
+                for (_, _, rw_j, am_j) in pend[i][k:]:
+                    ret += disc * rw_j * alive
+                    alive &= am_j
+                    disc *= gamma
+                put(o0, a0, ret, nx, alive, d, disc)
+
+            if done[i]:
+                for k in range(len(pend[i])):
+                    emit(k, nx_i, float(term[i]))
+                pend[i].clear()
+            elif len(pend[i]) >= n_step:
+                emit(0, nx_i, 0.0)
+                pend[i].pop(0)
         obs = nobs
         n_steps += N
         size = C if full else ptr
@@ -305,12 +348,13 @@ def train(tapes_glob: str, out: str, cfg: RunnerAgentConfig, steps: int, warmup:
                 r2, g2, m2, am2 = t(B_r2), t(B_g2), t(B_m2), t(B_am2)
                 rw = t(B_rew) / math.sqrt(rms.var + 1e-8)
                 d = t(B_d)[:, None]
+                disc = t(B_disc)[:, None]
                 n_on = am.sum().clamp(min=1)
                 alpha = log_alpha.exp().detach()
                 with torch.no_grad():
                     _, a2, lp2 = actor.sample(r2, g2, m2, am2)
                     qt = torch.min(q1t(r2, g2, m2, a2), q2t(r2, g2, m2, a2)) - alpha * lp2
-                    y = rw + gamma * (1 - d) * am2 * qt  # offline next step: no more value for that runner
+                    y = rw + disc * (1 - d) * am2 * qt  # offline next step: no more value for that runner
                 ql = ((((q1(r, g, m, a) - y) ** 2) + ((q2(r, g, m, a) - y) ** 2)) * am).sum() / n_on
                 q_opt.zero_grad()
                 ql.backward()
