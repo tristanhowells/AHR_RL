@@ -497,3 +497,20 @@ def replace_cfg(c):
     from dataclasses import replace
 
     return replace(c, bankroll=1e9)
+
+
+def test_top_races_selection_and_folds(tmp_path):
+    from ahr_rl.top_races import folds_of, top_races
+
+    paths = []
+    for i, scale in enumerate((1.0, 5.0, 3.0)):
+        t = make_synthetic_tape(i)
+        t.total_matched = t.total_matched * scale
+        p = str(tmp_path / f"2026090{i + 1}_1200_Test_1_{i}.npz")
+        t.save(p)
+        paths.append(p)
+    top = top_races(paths, 2, workers=1)
+    assert list(top["race"]) == ["20260902_1200_Test_1_1", "20260903_1200_Test_1_2"]  # by matched at the off
+    f = folds_of([f"2026090{i}" for i in range(1, 10)] + ["20260910"], 5)
+    assert len(f) == 5 and sum(len(x) for x in f) == 10 and f[0] == ["20260901", "20260902"]
+    assert len({r for x in f for r in x}) == 10  # every race in exactly one fold

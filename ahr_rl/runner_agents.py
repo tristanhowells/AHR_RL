@@ -204,12 +204,13 @@ def train(tapes_glob: str, out: str, cfg: RunnerAgentConfig, steps: int, warmup:
           device: str, buffer: int = 400_000, batch: int = 256, update_every: int = 2, grad_steps: int = 1,
           lr: float = 3e-4, gamma: float = 0.995, tau: float = 0.005, init_alpha: float = 0.05,
           target_entropy_per_dim: float = 1.0, d_model: int = 64, n_layers: int = 2, eval_races: int = 100,
-          warmup_mode: str = "mixed", env_cls=None, n_act: int = N_ACT) -> str:
-    """Independent-learner SAC with shared weights. Returns the path of the VAL-best checkpoint."""
+          warmup_mode: str = "mixed", env_cls=None, n_act: int = N_ACT, split=None) -> str:
+    """Independent-learner SAC with shared weights. Returns the path of the VAL-best checkpoint.
+    split: optional (train, val, test) lists of tape paths instead of the chronological split of tapes_glob."""
     torch.manual_seed(seed)
     np.random.seed(seed)
     os.makedirs(out, exist_ok=True)
-    tr, va, te = split_by_date(list_tapes(tapes_glob))
+    tr, va, te = split if split is not None else split_by_date(list_tapes(tapes_glob))
     json.dump({"train": tr, "val": va, "test": te}, open(os.path.join(out, "split.json"), "w"), indent=1)
     env_cls = env_cls or RunnerAgentEnv
     tcfg = replace(cfg, random_start_s=30.0)
