@@ -610,3 +610,90 @@ def test_bracket_agents():
         assert env2.trades[0]["reason"] in ("bsp", "end") and abs(env2.ex.W[1] - env2.ex.L[1]) < 0.01
     d = env2.demo_action().reshape(N_ACT6, R_MAX)
     assert (d[0] >= 0).all() and ((d[0] == 0) | (d[2] == np.float32(0.9))).all()
+
+
+def _synth_model(tmp_path, n=6, calibrate_iters=0):
+    from ahr_rl import synth_market
+    from ahr_rl.synthetic import make_bounce_tape
+
+    paths = []
+    for i in range(n):
+        t = make_bounce_tape(100 + i)
+        t.name = f"2026010{1 + i % 3}_Test_{i}"
+        t.winner = i % t.n_runners
+        p = str(tmp_path / f"{t.name}.npz")
+        t.save(p)
+        paths.append(p)
+    m = synth_market.fit(paths, str(tmp_path / "model.pkl"), threads=1, calibrate_iters=calibrate_iters, calib_markets=2)
+    return m, paths
+
+
+def test_synth_market_generates_valid_tapes(tmp_path):
+    from ahr_rl import synth_market
+    from ahr_rl.tape import Tape
+
+    m, _ = _synth_model(tmp_path, calibrate_iters=1)
+    assert {"sigma_u", "beta", "drift_mult", "drift_mu", "bsp_q"} <= set(m)
+    t = synth_market.generate_market(m, np.random.default_rng(3), "20990101_SYN_t")
+    live = (t.back_tick[:, :, 0] >= 0) & (t.lay_tick[:, :, 0] >= 0)
+    assert live.any() and (t.back_tick[:, :, 0][live] < t.lay_tick[:, :, 0][live]).all()  # never a crossed book
+    assert t.suspended[-1] and t.went_in_play and t.active[-1, t.winner] and (t.bsp[t.active[-1]] > 1).all()
+    assert len(t.trade_step) and (np.diff(t.trade_step) >= 0).all()
+    p = str(tmp_path / "syn.npz")
+    t.save(p)
+    t2 = Tape.load(p)  # our Tape format, so every env and study reads it unchanged
+    assert t2.n_steps == t.n_steps and t2.winner == t.winner
+    # same seed -> same race
+    t3 = synth_market.generate_market(m, np.random.default_rng(3), "20990101_SYN_t")
+    assert np.array_equal(t.back_tick, t3.back_tick) and t.winner == t3.winner
+
+
+def test_synth_market_informed_trades_and_no_planted_trend(tmp_path):
+    from ahr_rl import synth_market
+
+    m, _ = _synth_model(tmp_path)
+    m0 = dict(m, beta=0.0, sigma_u=0.0, drift_mult=0.0)
+    m1 = dict(m0, beta=4.0)
+    races = lambda M: [synth_market.generate_market(M, np.random.default_rng(i), f"x{i}") for i in range(4)]
+    s0, s1 = synth_market.dyn_stats(races(m0)), synth_market.dyn_stats(races(m1))
+    # informed flow: trades lean towards where the latent price goes next (adverse selection for resting orders)
+    assert s1["trade_ic"] > s0["trade_ic"] + 0.05
+    # no bridge to a known close: with no drift spells there is no planted momentum
+    assert abs(s0["mom_ic"]) < 0.1
+
+
+def test_synth_secant_is_bounded():
+    from ahr_rl.synth_market import _secant
+
+    # a wild slope estimate cannot more than double or halve the parameter in one step
+    assert _secant([(0.1, 0.5), (0.11, 0.2)], 1.0, 0.0, 10.0, increasing=False) <= 0.11 * 1.0 + 0.11 + 1e-9
+    assert _secant([(1.0, 0.0)], 0.5, 0.0, 10.0, increasing=True) > 1.0  # one point: a step towards the target
+
+
+def test_synth_bracket_env_live_and_real(tmp_path):
+    from ahr_rl.bracket_agents import BracketConfig
+    from ahr_rl.synth_sac import synth_env_cls
+    from ahr_rl.tape import Tape
+
+    _, paths = _synth_model(tmp_path)
+    cls = synth_env_cls(str(tmp_path / "model.pkl"))
+    env = cls(["<synthetic>"], BracketConfig(min_best_usd=0.0), seed=1)
+    _, info = env.reset(seed=1)
+    assert info["market"].startswith("20990101_LIVE_")  # a fresh synthetic race per episode
+    _, info2 = env.reset()
+    assert info2["market"] != info["market"]
+    real = Tape.load(paths[0])
+    _, info3 = env.reset(options={"tape": real})  # VAL / TEST scoring still plays the real race
+    assert info3["market"] == real.name
+
+
+def test_synth_parity_runs(tmp_path):
+    from ahr_rl import synth_market
+    from ahr_rl.synth_parity import parity
+
+    _, paths = _synth_model(tmp_path)
+    pool = synth_market.write_pool(str(tmp_path / "model.pkl"), str(tmp_path / "pool"), 3, seed=1)
+    df, ok = parity(paths[:3], pool, workers=1, out=str(tmp_path / "par"))
+    crit = set(df.loc[df["critical"], "stat"])
+    assert {"mom30_ic", "driftfade_120", "cross_ev_back", "adverse_back", "fill60_back"} <= crit
+    assert os.path.exists(tmp_path / "par" / "parity.json") and isinstance(ok, bool)

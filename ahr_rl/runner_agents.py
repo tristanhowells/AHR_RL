@@ -205,14 +205,22 @@ def train(tapes_glob: str, out: str, cfg: RunnerAgentConfig, steps: int, warmup:
           lr: float = 3e-4, gamma: float = 0.995, tau: float = 0.005, init_alpha: float = 0.05,
           target_entropy_per_dim: float = 1.0, d_model: int = 64, n_layers: int = 2, eval_races: int = 100,
           warmup_mode: str = "mixed", env_cls=None, n_act: int = N_ACT, split=None, val_score=None,
-          n_step: int = 1, demo_frac: float = 0.0) -> str:
+          n_step: int = 1, demo_frac: float = 0.0, init_from: str | None = None, alpha_floor: float = 0.0,
+          warmup_policy: str = "random", eval_initial: bool = False, eval_every_n: int = 10) -> str:
     """Independent-learner SAC with shared weights. Returns the path of the VAL-best checkpoint.
     split: optional (train, val, test) lists of tape paths instead of the chronological split of tapes_glob.
     val_score: optional f(policy, val_tapes, cfg) -> float for picking the checkpoint (default: mean green $).
     n_step: n-step returns (a runner's rewards over the next n decisions, while it stays online, then bootstrap
             with gamma ** n), so a delayed outcome reaches the decision that caused it in one update.
     demo_frac: share of WARM-UP episodes played by the env's own demo_action() (a known strategy) instead of
-            random strategies, so the replay buffer holds worked examples from the start."""
+            random strategies, so the replay buffer holds worked examples from the start.
+    init_from: checkpoint to start from (fine-tuning): its actor, and its critics and alpha when saved.
+    alpha_floor: the entropy weight never drops below this (keeps exploring however sure the critic gets).
+    warmup_policy: "random" (random strategies + demos) or "actor" (the current actor, sampled; for fine-tuning,
+            so the buffer fills with the pretrained policy's own experience before updates start).
+    eval_initial: score the starting actor on VAL before any update, as a checkpoint candidate (fine-tuning:
+            the pretrained policy must be beaten, not just replaced).
+    eval_every_n: number of VAL checkpoints over the learning phase."""
     torch.manual_seed(seed)
     np.random.seed(seed)
     os.makedirs(out, exist_ok=True)
@@ -241,6 +249,18 @@ def train(tapes_glob: str, out: str, cfg: RunnerAgentConfig, steps: int, warmup:
     log_alpha = torch.tensor(math.log(init_alpha), device=dev, requires_grad=True)
     al_opt = torch.optim.Adam([log_alpha], lr=lr)
     tgt_ent = -target_entropy_per_dim * n_act
+    if init_from:
+        ck0 = torch.load(init_from, map_location=dev, weights_only=False)
+        actor.load_state_dict(ck0["actor"])
+        if "q1" in ck0:
+            q1.load_state_dict(ck0["q1"])
+            q2.load_state_dict(ck0["q2"])
+            q1t.load_state_dict(ck0["q1"])
+            q2t.load_state_dict(ck0["q2"])
+        if "log_alpha" in ck0:
+            log_alpha.data.fill_(max(float(ck0["log_alpha"]), math.log(max(alpha_floor, 1e-8))))
+        args["init_from"] = init_from
+    log_floor = math.log(alpha_floor) if alpha_floor > 0 else None
 
     C = buffer
     B_r, B_r2 = np.zeros((C, R, F), np.float16), np.zeros((C, R, F), np.float16)
@@ -257,13 +277,46 @@ def train(tapes_glob: str, out: str, cfg: RunnerAgentConfig, steps: int, warmup:
     rms = RunningMeanStd()
     explorer = RandomStrategies(N, F, G, warmup_mode, 0.3, seed)
     logf = open(os.path.join(out, "train_log.csv"), "w")
-    logf.write("iter,steps,sps,online_runners,ep_green_mean,ep_turnover_mean,val_green,val_pct_green,val_turnover\n")
+    logf.write("iter,steps,sps,online_runners,ep_green_mean,ep_turnover_mean,val_green,val_pct_green,val_turnover,alpha\n")
     stats, online, best, n_steps, t0 = [], [], -np.inf, 0, time.time()
     n_iters = steps // N
-    eval_every = max(1, (steps - warmup) // N // 10)  # ~10 checkpoints, all after the random warm-up
+    eval_every = max(1, (steps - warmup) // N // max(1, eval_every_n))  # checkpoints, all after the warm-up
+
+    def checkpoint(it):
+        nonlocal best
+        actor.eval()
+        pol_ = make_runner_policy(actor, dev)
+        val = summarise(evaluate(pol_, va[:eval_races], cfg, env_cls=env_cls))
+        if val_score is not None:  # the objective's own score picks the checkpoint
+            val["mean_green_$"] = float(val_score(pol_, va[:eval_races], cfg))
+        actor.train()
+        ck = {"actor": actor.state_dict(), "q1": q1.state_dict(), "q2": q2.state_dict(),
+              "log_alpha": float(log_alpha.detach()), "args": args, "iter": it, "val": val}
+        if val["mean_green_$"] > best:
+            best = val["mean_green_$"]
+            torch.save(ck, os.path.join(out, "best.pt"))
+        torch.save(ck, os.path.join(out, "last.pt"))
+        eg = np.mean([x[0] for x in stats[-50:]]) if stats else np.nan
+        et = np.mean([x[1] for x in stats[-50:]]) if stats else np.nan
+        sps = n_steps / max(time.time() - t0, 1e-9)
+        on = float(np.mean(online[-1000:])) if online else 0.0
+        alpha_now = float(log_alpha.exp())
+        logf.write(f"{it},{n_steps},{sps:.0f},{on:.2f},{eg:.3f},{et:.1f},{val['mean_green_$']:.3f},"
+                   f"{val['pct_green']:.1f},{val['mean_turnover_$']:.1f},{alpha_now:.4f}\n")
+        logf.flush()
+        print(f"[runner-sac] it {it} steps {n_steps} sps {sps:.0f} | online runners {on:.2f} | alpha {alpha_now:.3f} | "
+              f"train green {eg:+.2f} turnover {et:.0f} | VAL green {val['mean_green_$']:+.2f} "
+              f"({val['pct_green']:.0f}% green, turnover {val['mean_turnover_$']:.0f})", flush=True)
+
+    if init_from and eval_initial:
+        checkpoint(0)
     for it in range(1, n_iters + 1):
         am_np = obs["act_mask"].astype(bool)
-        if n_steps < warmup:
+        if n_steps < warmup and warmup_policy == "actor":
+            with torch.no_grad():
+                _, a, _ = actor.sample(*obs_t(obs, dev), act_mask_t(obs, dev))
+            act = a.cpu().numpy()
+        elif n_steps < warmup:
             ra = explorer.act(obs)  # convictions (masked) + one wager fraction per env
             act = np.zeros((N, R, n_act), np.float32)
             act[..., 0] = ra[:, :R_MAX]
@@ -371,6 +424,9 @@ def train(tapes_glob: str, out: str, cfg: RunnerAgentConfig, steps: int, warmup:
                 al_opt.zero_grad()
                 alpha_loss.backward()
                 al_opt.step()
+                if log_floor is not None:
+                    with torch.no_grad():
+                        log_alpha.clamp_(min=log_floor)
                 with torch.no_grad():
                     for net, tn in ((q1, q1t), (q2, q2t)):
                         for p, pt in zip(net.parameters(), tn.parameters()):
@@ -378,30 +434,11 @@ def train(tapes_glob: str, out: str, cfg: RunnerAgentConfig, steps: int, warmup:
         # no checkpoints during the warm-up: the untrained actor's deterministic action is "no bet" ($0 on VAL)
         # and would otherwise win "best" whenever every trained checkpoint loses
         if n_steps >= warmup and (it % eval_every == 0 or it == n_iters):
-            actor.eval()
-            pol_ = make_runner_policy(actor, dev)
-            val = summarise(evaluate(pol_, va[:eval_races], cfg, env_cls=env_cls))
-            if val_score is not None:  # the objective's own score picks the checkpoint
-                val["mean_green_$"] = float(val_score(pol_, va[:eval_races], cfg))
-            actor.train()
-            ck = {"actor": actor.state_dict(), "args": args, "iter": it, "val": val}
-            if val["mean_green_$"] > best:
-                best = val["mean_green_$"]
-                torch.save(ck, os.path.join(out, "best.pt"))
-            torch.save(ck, os.path.join(out, "last.pt"))
-            eg = np.mean([x[0] for x in stats[-50:]]) if stats else np.nan
-            et = np.mean([x[1] for x in stats[-50:]]) if stats else np.nan
-            sps = n_steps / (time.time() - t0)
-            on = float(np.mean(online[-1000:]))
-            logf.write(f"{it},{n_steps},{sps:.0f},{on:.2f},{eg:.3f},{et:.1f},{val['mean_green_$']:.3f},"
-                       f"{val['pct_green']:.1f},{val['mean_turnover_$']:.1f}\n")
-            logf.flush()
-            print(f"[runner-sac] it {it} steps {n_steps} sps {sps:.0f} | online runners {on:.2f} | train green "
-                  f"{eg:+.2f} turnover {et:.0f} | VAL green {val['mean_green_$']:+.2f} ({val['pct_green']:.0f}% "
-                  f"green, turnover {val['mean_turnover_$']:.0f})", flush=True)
+            checkpoint(it)
     venv.close()
     if not os.path.exists(os.path.join(out, "best.pt")):  # run too short for a learning-phase checkpoint
-        ck = {"actor": actor.state_dict(), "args": args, "iter": n_iters, "val": None}
+        ck = {"actor": actor.state_dict(), "q1": q1.state_dict(), "q2": q2.state_dict(),
+              "log_alpha": float(log_alpha.detach()), "args": args, "iter": n_iters, "val": None}
         torch.save(ck, os.path.join(out, "best.pt"))
         torch.save(ck, os.path.join(out, "last.pt"))
     return os.path.join(out, "best.pt")
