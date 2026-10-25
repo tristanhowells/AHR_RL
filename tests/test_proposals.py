@@ -697,3 +697,16 @@ def test_synth_parity_runs(tmp_path):
     crit = set(df.loc[df["critical"], "stat"])
     assert {"mom30_ic", "driftfade_120", "cross_ev_back", "adverse_back", "fill60_back"} <= crit
     assert os.path.exists(tmp_path / "par" / "parity.json") and isinstance(ok, bool)
+
+
+def test_control_gate_scaled_to_control_races(tmp_path):
+    from ahr_rl.blackbox import control_gate, gate_summary
+    from ahr_rl.synthetic import write_synthetic
+
+    paths = write_synthetic(str(tmp_path / "bounce"), 4, seed0=70_000, kind="bounce")
+    assert control_gate(0.0, paths) == 0.0  # no gate stays no gate
+    assert control_gate(20.0, paths) == 20.0  # a real gate the control races clear is kept
+    g = control_gate(148.6, paths)  # the --min-matched 20000 gate: bounce races never show that much
+    assert 0 < g < 148.6
+    assert gate_summary(paths, g)["runner_share_open"] > 0.5  # so the control can trade
+    assert gate_summary(paths, 148.6)["runner_share_open"] == 0.0  # what the 25 Oct controls ran with

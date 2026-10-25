@@ -38,7 +38,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from .blackbox import gate_summary, liquidity_cut, race_t
+from .blackbox import control_gate, gate_summary, liquidity_cut, race_t
 from .env import list_tapes, split_by_date
 from .evaluate import run_episode
 from .features import R_MAX
@@ -217,12 +217,16 @@ def main(argv=None):
         write_synthetic(syn, a.control_races, seed0=70_000, kind="bounce")
         g_ = os.path.join(syn, "*.npz")
         ctr, cva, cte = split_by_date(list_tapes(g_))
-        ck = train(g_, os.path.join(a.out, "control"), cfg, a.control_steps, int(a.control_steps * a.warmup_frac), 0,
+        ccfg = replace(cfg, min_best_usd=control_gate(cut, list_tapes(g_)))  # gate scaled to the control races
+        if ccfg.min_best_usd != cut:
+            print(f"control gate ${ccfg.min_best_usd:.2f} (the real gate ${cut:.2f} is above what the synthetic "
+                  f"races ever show)", flush=True)
+        ck = train(g_, os.path.join(a.out, "control"), ccfg, a.control_steps, int(a.control_steps * a.warmup_frac), 0,
                    eval_races=min(a.eval_races, 30), split=(ctr, cva, cte), **kw)
         pol = make_runner_policy(load_runner_actor(ck, a.device), a.device)
         for name, p in (("do nothing", noop_policy), ("random", random_policy()), ("agent", pol)):
-            rows.append(dict(run="control", **summarise(name, score_races(p, cte, cfg))))
-        ctl = score_races(pol, cte, cfg)
+            rows.append(dict(run="control", **summarise(name, score_races(p, cte, ccfg))))
+        ctl = score_races(pol, cte, ccfg)
         obj = ctl["p_profit"] - ctl["p_loss"]
         control_ok = bool(obj.mean() > 0 and (race_t(obj) or 0) > 2)
         print(pd.DataFrame([r for r in rows if r["run"] == "control"]).round(3).to_string(index=False))

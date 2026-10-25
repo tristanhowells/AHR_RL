@@ -99,6 +99,17 @@ def liquidity_cut(paths, q: float = 0.8, window_s: float = 10.0) -> float:
     return float(np.quantile(v, q)) if len(v) else 0.0
 
 
+def control_gate(cut: float, control_paths, q: float = 0.1) -> float:
+    """Gate for a positive control on synthetic races: the real gate, unless it is above what those races show.
+    A gate set on big real markets (--min-matched 20000: $148.6) would leave every synthetic runner (bounce
+    races show ~$60 at the best prices) untradeable, so the control could never find its planted edge. Then
+    the control uses the q-quantile of its own races (~90% of runner snapshots pass): the gate inputs stay on,
+    so the control trains the same network as the real run."""
+    if cut <= 0:
+        return cut
+    return float(min(cut, liquidity_cut(control_paths, q)))
+
+
 def gate_summary(paths, cut: float, window_s: float = 10.0) -> dict:
     """How often the gate is open on these races (last 5 min)."""
     if cut <= 0:
@@ -260,17 +271,21 @@ def main(argv=None):
         write_synthetic(syn_dir, a.control_races, seed0=50_000, trend_every_s=a.trend_every_s)
         glob_ = os.path.join(syn_dir, "*.npz")
         _, _, cte = split_by_date(list_tapes(glob_))
+        ccfg = replace(cfg, min_best_usd=control_gate(cut, list_tapes(glob_)))  # gate scaled to the control races
+        if ccfg.min_best_usd != cut:
+            print(f"control gate ${ccfg.min_best_usd:.2f} (the real gate ${cut:.2f} is above what the synthetic "
+                  f"races ever show)", flush=True)
         if cut > 0:
-            gates["control_test"] = gate_summary(cte, cut)
+            gates["control_test"] = gate_summary(cte, ccfg.min_best_usd)
             print(f"gate on synthetic races: {gates['control_test']['runner_share_open'] * 100:.0f}% of runner "
                   f"snapshots pass", flush=True)
         ck = run_sac(glob_, os.path.join(a.out, "control"), a.control_steps, a.warmup_frac, 0, a.n_envs,
                      a.device, a.max_fraction, a.buffer, min(a.eval_races, 30), a.decision_every,
-                     a.update_every, a.grad_steps, cut, not a.no_gate_inputs)
-        rows.append(dict(run="control", **score("do nothing", evaluate(noop_policy, cte, cfg, env_cls=ContinuousAllocEnv))))
-        rows.append(dict(run="control", **score("random (f=0.02)", evaluate(random_cont_policy(), cte, cfg,
+                     a.update_every, a.grad_steps, ccfg.min_best_usd, not a.no_gate_inputs)
+        rows.append(dict(run="control", **score("do nothing", evaluate(noop_policy, cte, ccfg, env_cls=ContinuousAllocEnv))))
+        rows.append(dict(run="control", **score("random (f=0.02)", evaluate(random_cont_policy(), cte, ccfg,
                                                                               env_cls=ContinuousAllocEnv))))
-        _, ctl, _ = test_block("control", ck, cte, cfg, a.device, rows, stress=False)
+        _, ctl, _ = test_block("control", ck, cte, ccfg, a.device, rows, stress=False)
         control_ok = bool(ctl["mean_green"] > 0 and (ctl["t"] or 0) > 2)
         print(pd.DataFrame([r for r in rows if r["run"] == "control"]).round(3).to_string(index=False))
         print("control: the black box FINDS a small planted edge" if control_ok else

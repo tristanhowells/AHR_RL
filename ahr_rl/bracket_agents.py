@@ -43,7 +43,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from .blackbox import gate_summary, liquidity_cut, score
+from .blackbox import control_gate, gate_summary, liquidity_cut, score
 from .env import list_tapes, split_by_date
 from .env_continuous import ContinuousAllocEnv
 from .evaluate import evaluate, run_episode
@@ -408,11 +408,15 @@ def main(argv=None):
         write_synthetic(syn, a.control_races, seed0=70_000, kind="bounce")
         g_ = os.path.join(syn, "*.npz")
         ctr, cva, cte = split_by_date(list_tapes(g_))
-        ck = train(g_, os.path.join(a.out, "control"), cfg, a.control_steps, int(a.control_steps * a.warmup_frac), 0,
+        ccfg = replace(cfg, min_best_usd=control_gate(cut, list_tapes(g_)))  # gate scaled to the control races
+        if ccfg.min_best_usd != cut:
+            print(f"control gate ${ccfg.min_best_usd:.2f} (the real gate ${cut:.2f} is above what the synthetic "
+                  f"races ever show)", flush=True)
+        ck = train(g_, os.path.join(a.out, "control"), ccfg, a.control_steps, int(a.control_steps * a.warmup_frac), 0,
                    eval_races=min(a.eval_races, 30), split=(ctr, cva, cte), **dict(kw, demo_frac=0.0))
-        rows.append(dict(run="control", **score("do nothing", evaluate(noop_policy, cte, cfg, env_cls=BracketAgentEnv))))
-        rows.append(dict(run="control", **score("random", evaluate(random_policy(), cte, cfg, env_cls=BracketAgentEnv))))
-        _, ctl, _ = test_block("control", ck, cte, cfg, a.device, rows, stress=False, env_cls=BracketAgentEnv)
+        rows.append(dict(run="control", **score("do nothing", evaluate(noop_policy, cte, ccfg, env_cls=BracketAgentEnv))))
+        rows.append(dict(run="control", **score("random", evaluate(random_policy(), cte, ccfg, env_cls=BracketAgentEnv))))
+        _, ctl, _ = test_block("control", ck, cte, ccfg, a.device, rows, stress=False, env_cls=BracketAgentEnv)
         control_ok = bool(ctl["mean_green"] > 0 and (ctl["t"] or 0) > 2)
         print(pd.DataFrame([r for r in rows if r["run"] == "control"]).round(3).to_string(index=False))
         print("control: the agents FIND the resting-only edge" if control_ok else
