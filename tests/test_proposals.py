@@ -710,3 +710,29 @@ def test_control_gate_scaled_to_control_races(tmp_path):
     assert 0 < g < 148.6
     assert gate_summary(paths, g)["runner_share_open"] > 0.5  # so the control can trade
     assert gate_summary(paths, 148.6)["runner_share_open"] == 0.0  # what the 25 Oct controls ran with
+
+
+def test_back_all_unbiased_green(tmp_path):
+    from ahr_rl.back_all_study import race_rows, runner_trade
+    from ahr_rl.ladder import PRICES
+
+    t = make_synthetic_tape(0, trend_every_s=30.0)
+    s_in, s_out = int(np.where(t.t_rel >= -540)[0][0]), int(np.where(t.t_rel <= -10)[0][-1])
+    for r in range(t.n_runners):
+        b = runner_trade(t, r, s_in, s_out, "back", 10.0)
+        lay = runner_trade(t, r, s_in, s_out, "lay", 10.0)
+        # unbiased: the same green whether the runner wins or loses, = S * (P_in / P_out - 1) at the touch
+        assert np.isclose(b["win"], b["lose"]) and np.isclose(lay["win"], lay["lose"])
+        pb, pl = PRICES[t.back_tick[s_in, r, 0]], PRICES[t.lay_tick[s_out, r, 0]]
+        assert np.isclose(b["win"], 10 * (pb / pl - 1))
+        pl2, pb2 = PRICES[t.lay_tick[s_in, r, 0]], PRICES[t.back_tick[s_out, r, 0]]
+        assert np.isclose(lay["win"], 10 * (1 - pl2 / pb2))
+    t.name = "20260101_Syn_0"
+    t.winner = 0
+    p = str(tmp_path / "20260101_Syn_0.npz")
+    t.save(p)
+    races, _ = race_rows(p)
+    assert set(races["entry_min"]) == {9, 5, 4, 3, 2, 1}
+    both = races.groupby("entry_min")["drift"].sum()  # backing and laying everything: the drifts cancel
+    assert np.allclose(both, 0.0)
+    assert (races["spread"] < 0).all()  # crossing twice always costs
