@@ -12,9 +12,12 @@ Settlement: the market's P&L in every outcome (each runner winning), commission 
 positive net market result only. "green" = the worst outcome after commission (the profit locked in);
 "realised" = the actual winner's outcome where the result is known.
 
-Split of the green, per runner and summed per race:
+green_touch = every green-up filled in full at the best hedge price: the theory itself, separated from whether
+the visible ladder 10s out can take the green-up (on long shots it often cannot: a $10 lay of a 200 shot is a
+$1,990 liability, and what the ladder can't take stays open, so "green" - the worst outcome - is dominated by it).
+Split of green_touch, per runner and summed per race:
   drift   what the mid price move alone paid: back S * (mid_in / mid_out - 1), lay S * (1 - mid_in / mid_out)
-  spread  the rest: the cost of crossing the spread twice (and walking the ladder) - always negative
+  spread  the rest: the cost of crossing the spread twice (and walking the entry ladder) - always negative
 Backing everything wins when prices shorten on average between entry and hedge and loses when they drift; laying
 everything is the mirror image, so "back+lay" (both at once) is the pure round-trip cost.
 
@@ -77,23 +80,32 @@ def runner_trade(t: Tape, r: int, s_in: int, s_out: int, side: str, stake: float
         o_ticks, o_sizes = bt_out, bs_out
     if s <= 0:
         return None
-    h, p_out = s * p_in / PRICES[o_ticks[0]], PRICES[o_ticks[0]]
-    for _ in range(4):  # the hedge's own VWAP depends on its size
+    p_touch = PRICES[o_ticks[0]]  # best hedge price, ignoring how much is there
+    p_out, want, h = p_touch, s * p_in / p_touch, 0.0
+    for _ in range(6):  # the hedge's own VWAP depends on its size
         want = s * p_in / p_out
         h, p2 = walk(o_ticks, o_sizes, want)
-        if h <= 0:
+        if h <= 0 or not np.isfinite(p2):
+            break
+        if h < want - 1e-9:  # not enough on the ladder: a partial green-up, the rest stays open
+            p_out = p2
+            break
+        if abs(p2 - p_out) < 1e-9:
             break
         p_out = p2
-        if h < want - 1e-9:  # not enough on the ladder: a partial green-up, the rest stays open
-            break
+    want = s * p_in / p_out
+    h = min(h, want)
     if side == "back":
         win, lose = s * (p_in - 1) - h * (p_out - 1), -s + h
         drift = s * (mid_in / mid_out - 1)
+        touch = s * (p_in / p_touch - 1)
     else:
         win, lose = -s * (p_in - 1) + h * (p_out - 1), s - h
         drift = s * (1 - mid_in / mid_out)
+        touch = s * (1 - p_in / p_touch)
     return dict(runner=r, stake=s, p_in=p_in, p_out=p_out, hedge=h, win=win, lose=lose, drift=drift,
-                mid_in=mid_in, mid_out=mid_out, full_hedge=bool(h >= s * p_in / p_out - 1e-6))
+                touch=touch, hedge_frac=float(h / want) if want > 0 else 0.0, mid_in=mid_in, mid_out=mid_out,
+                full_hedge=bool(h >= want * (1 - 1e-6)))
 
 
 def race_rows(path: str, entries=ENTRIES_S, hedge_s: float = 10.0, stake: float = 10.0) -> pd.DataFrame | None:
@@ -140,16 +152,21 @@ def race_rows(path: str, entries=ENTRIES_S, hedge_s: float = 10.0, stake: float 
             if 0 <= t.winner < t.n_runners:
                 w = d.index[d["runner"] == t.winner]
                 realised = net(L.sum() - L[w[0]] + W[w[0]]) if len(w) else net(L.sum())
+            full = d["full_hedge"].to_numpy()
             rows.append(dict(race=race, day=race[:8], side=side, entry_min=e / 60, runners=len(d),
+                             green_touch=net(float(d["touch"].sum())),
+                             green_hedged=net(float(((d["win"] + d["lose"]) / 2)[full].sum())),
+                             staked_hedged=float(d["stake"][full].sum()),
+                             open_liability=float(-np.minimum(d["win"], d["lose"])[~full].sum()),
                              staked=float(d["stake"].sum()), green=green, realised=realised,
-                             drift=float(d["drift"].sum()), spread=float((d["win"] + d["lose"]).sum() / 2 - d["drift"].sum()),
+                             drift=float(d["drift"].sum()), spread=float(d["touch"].sum() - d["drift"].sum()),
                              full_hedges=float(d["full_hedge"].mean()), sub_min_hedges=int((d["hedge"] < 5.0).sum()),
                              t_in=float(t.t_rel[s_in]), t_out=float(t.t_rel[s_out])))
             d["green"] = (d["win"] + d["lose"]) / 2  # per runner, before commission (win == lose when fully hedged)
             d["rank"] = rank[d["runner"].to_numpy()]
             d["race"], d["side"], d["entry_min"] = race, side, e / 60
             runner_rows.append(d[["race", "side", "entry_min", "runner", "rank", "stake", "p_in", "p_out", "green",
-                                  "drift"]])
+                                  "touch", "drift", "hedge_frac", "full_hedge"]])
     if not rows:
         return None
     return pd.DataFrame(rows), pd.concat(runner_rows, ignore_index=True)
@@ -168,24 +185,43 @@ def summary(df: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for (side, e), g in df.groupby(["side", "entry_min"]):
         r = rt(g["green"], g["race"])
+        rt_ = rt(g["green_touch"], g["race"])
         rows.append(dict(side=side, entry_min=e, races=r["races"], runners_per_race=g["runners"].mean(),
+                         green_touch_per_race=rt_["mean"], t_touch=rt_["t"],
+                         touch_return_pct=g["green_touch"].sum() / g["staked"].sum() * 100,
+                         hedged_return_pct=g["green_hedged"].sum() / max(g["staked_hedged"].sum(), 1e-9) * 100,
+                         open_liability_per_race=g["open_liability"].mean(),
                          staked_per_race=g["staked"].mean(), green_per_race=r["mean"], t=r["t"],
-                         pct_races_green=(g["green"] > 0).mean() * 100, return_per_staked_pct=g["green"].sum() / g["staked"].sum() * 100,
+                         pct_races_green=(g["green_touch"] > 0).mean() * 100, return_per_staked_pct=g["green"].sum() / g["staked"].sum() * 100,
                          drift_per_race=g["drift"].mean(), spread_per_race=g["spread"].mean(),
                          realised_per_race=g["realised"].mean(), full_hedge_pct=g["full_hedges"].mean() * 100,
                          sub_min_hedges_per_race=g["sub_min_hedges"].mean()))
     return pd.DataFrame(rows)
 
 
+def by_group(rr: pd.DataFrame, col: str) -> pd.DataFrame:
+    """Per runner, % of stake: green if the whole green-up filled at the best price (touch), the mid-price
+    drift part, and how much of the green-up the visible ladder could actually take."""
+    rows = []
+    for (side, e, g_), g in rr.groupby(["side", "entry_min", col], observed=True):
+        r = rt(g["touch"] / g["stake"] * 100, g["race"])
+        rows.append({"side": side, "entry_min": e, col: g_, "runners": len(g), "touch_green_pct": r["mean"],
+                     "t": r["t"], "drift_pct": float((g["drift"] / g["stake"]).mean() * 100),
+                     "fully_greened_pct": float(g["full_hedge"].mean() * 100),
+                     "hedge_filled_pct": float(g["hedge_frac"].mean() * 100)})
+    return pd.DataFrame(rows)
+
+
 def by_rank(rr: pd.DataFrame) -> pd.DataFrame:
     rr = rr.copy()
-    rr["rank_g"] = pd.cut(rr["rank"], [0, 1, 3, 6, 99], labels=["fav", "2-3", "4-6", "7+"])
-    rows = []
-    for (side, e, g_), g in rr.groupby(["side", "entry_min", "rank_g"], observed=True):
-        r = rt(g["green"] / g["stake"] * 100, g["race"])
-        rows.append(dict(side=side, entry_min=e, rank=g_, runners=len(g), green_per_staked_pct=r["mean"], t=r["t"],
-                         drift_per_staked_pct=float((g["drift"] / g["stake"]).mean() * 100)))
-    return pd.DataFrame(rows)
+    rr["rank"] = pd.cut(rr["rank"], [0, 1, 3, 6, 99], labels=["fav", "2-3", "4-6", "7+"])
+    return by_group(rr, "rank")
+
+
+def by_price(rr: pd.DataFrame) -> pd.DataFrame:
+    rr = rr.copy()
+    rr["odds"] = pd.cut(rr["p_in"], [1, 3, 6, 11, 21, 51, 1001], labels=["<3", "3-6", "6-11", "11-21", "21-51", "51+"])
+    return by_group(rr, "odds")
 
 
 def main(argv=None):
@@ -219,6 +255,8 @@ def main(argv=None):
                                                                                    as_index=False).agg(
         runners=("runners", "mean"), staked=("staked", "sum"), green=("green", "sum"), realised=("realised", "sum"),
         drift=("drift", "sum"), spread=("spread", "sum"), full_hedges=("full_hedges", "mean"),
+        green_touch=("green_touch", "sum"), green_hedged=("green_hedged", "sum"), staked_hedged=("staked_hedged", "sum"),
+        open_liability=("open_liability", "sum"),
         sub_min_hedges=("sub_min_hedges", "sum"))
     both["side"] = "back+lay"
     df_all = pd.concat([df, both], ignore_index=True)
@@ -228,12 +266,20 @@ def main(argv=None):
     s.to_csv(os.path.join(a.out, "summary.csv"), index=False)
     rk = by_rank(rr)
     rk.to_csv(os.path.join(a.out, "by_rank.csv"), index=False)
+    pr = by_price(rr)
+    pr.to_csv(os.path.join(a.out, "by_odds.csv"), index=False)
     print(f"=== P21: back / lay every runner, unbiased green-up {a.hedge_s:.0f}s before the advertised start; "
           f"${a.stake:.0f} per runner; {df['race'].nunique()} races ===")
-    print("$ per race (green = worst outcome after commission); drift + spread = green before commission")
-    print(s.round(3).to_string(index=False))
-    print("\n=== By favourite rank at entry: green and mid-price drift, % of stake (race-clustered t) ===")
+    print("$ per race. green_touch = every green-up filled at the best price (the theory itself); green = the worst "
+          "outcome with the visible ladder (a green-up the ladder can't take leaves the rest open)")
+    cols = ["side", "entry_min", "races", "runners_per_race", "staked_per_race", "green_touch_per_race", "t_touch",
+            "touch_return_pct", "pct_races_green", "drift_per_race", "full_hedge_pct", "hedged_return_pct",
+            "open_liability_per_race", "green_per_race", "realised_per_race"]
+    print(s[cols].round(3).to_string(index=False))
+    print("\n=== By favourite rank at entry, % of stake per runner (race-clustered t) ===")
     print(rk.round(3).to_string(index=False))
+    print("\n=== By odds at entry ===")
+    print(pr.round(3).to_string(index=False))
     print(f"\nsaved to {a.out} ({(time.time() - t0) / 60:.1f} min)")
 
 

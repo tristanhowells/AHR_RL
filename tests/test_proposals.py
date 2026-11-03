@@ -736,3 +736,15 @@ def test_back_all_unbiased_green(tmp_path):
     both = races.groupby("entry_min")["drift"].sum()  # backing and laying everything: the drifts cancel
     assert np.allclose(both, 0.0)
     assert (races["spread"] < 0).all()  # crossing twice always costs
+
+
+def test_back_all_thin_ladder_leaves_exposure():
+    from ahr_rl.back_all_study import runner_trade
+
+    t = make_synthetic_tape(1, trend_every_s=30.0)
+    s_in, s_out = int(np.where(t.t_rel >= -540)[0][0]), int(np.where(t.t_rel <= -10)[0][-1])
+    t.back_size[s_out, 0, :] = 0.5  # almost nothing to back into at the green-up
+    x = runner_trade(t, 0, s_in, s_out, "lay", 10.0)
+    assert not x["full_hedge"] and x["hedge_frac"] < 0.5 and x["win"] < x["lose"]  # the rest stays open
+    full = runner_trade(make_synthetic_tape(1, trend_every_s=30.0), 0, s_in, s_out, "lay", 10.0)
+    assert full["full_hedge"] and np.isclose(full["touch"], full["win"])  # deep ladder: touch == realised green
