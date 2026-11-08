@@ -16,7 +16,14 @@ predictive power (IC ~0). This study looks at what those did not cover:
         lead_dp    the biggest 30s rise in implied probability among the OTHER runners (pp)
         lag        this runner's 30s change in implied probability minus what rebalancing implies
                    (-lead_dp x share / (1 - leader's share)); > 0 = it has not drifted enough yet
-  3. HOW MUCH IS LEFT at detection: the best further move the same way within 120s (MFE, ticks) and the worst
+  3. CONFIRMED moves - a gradual move plus an order-flow condition that agrees (or disagrees) with it:
+        wom_with / wom_against   weight of money (best 3 levels) moved the same way / against over 30s
+        wap_room / wap_past      the price is still on the far side of its session WAP (room to go) / already past
+        vol_accel                $ traded in the last 30s is >= 2x the pace of the 60s before
+        spn_with                 the projected SP is already beyond the price in the move's direction
+     plus a gradient-boosted model on every feature (moves, flow, WOM, WAP, projected SP, knock-on, rank, price,
+     spread, time) predicting the executable returns: threshold picked on VAL, TEST once.
+  4. HOW MUCH IS LEFT at detection: the best further move the same way within 120s (MFE, ticks) and the worst
      move against (MAE), against the round-trip cost in ticks.
 
 Executable trades: decided at the sample row, filled one row later (latency), crossing the spread; exit by
@@ -46,6 +53,7 @@ import numpy as np
 import pandas as pd
 
 from .env import list_tapes, split_by_date
+from .hindsight_study import flow_arrays, flow_features
 from .ladder import PRICES
 from .tape import Tape
 
@@ -125,6 +133,7 @@ def sample_race(path: str) -> pd.DataFrame | None:
     cvol = np.cumsum(vol, 0)
     d1 = np.diff(mt, axis=0, prepend=np.nan)  # tick change per row
     j5 = np.abs(mt - np.vstack([np.full((k(5), t.n_runners), np.nan), mt[:-k(5)]]))  # 5s move
+    _, wap, wom = flow_arrays(t)
     recs = []
     for s in rows:
         okr = np.where(np.isfinite(mt[s]))[0]
@@ -142,7 +151,9 @@ def sample_race(path: str) -> pd.DataFrame | None:
             if spread > MAX_SPREAD or mid[s, r] > MAX_PRICE or not (np.isfinite(bb[e, r]) and np.isfinite(bl[e, r])):
                 continue
             rec = dict(race=race, runner=int(r), t_to_start=float(-t.t_rel[s]), rank=int(rank[r]),
-                       price=float(mid[s, r]), spread=int(spread))
+                       price=float(mid[s, r]), spread=int(spread), wom=float(wom[s, r]),
+                       spn_gap=float(np.log(t.spn[s, r] / mid[s, r])) if t.spn[s, r] > 1 else np.nan)
+            rec.update(flow_features(cvol, wap, wom, mid, s, r, k))
             for W in WINDOWS:
                 s0 = s - k(W)
                 if s0 < 0 or not np.isfinite(mt[s0, r]):
@@ -230,6 +241,33 @@ def gradual_rules():
         yield dict(family="gradual", W=W, k=kk, persist=pp, gradual=grad, runners=runners, exit=ex, action=act)
 
 
+CONFIRMS = ("none", "wom_with", "wom_against", "wap_room", "wap_past", "vol_accel", "spn_with")
+
+
+def confirmed_rules():
+    for W, kk, conf, runners, ex, act in itertools.product(WINDOWS, (2, 3, 4), CONFIRMS[1:], ("top3", "all"), EXITS,
+                                                           ("follow", "fade")):
+        yield dict(family="confirmed", W=W, k=kk, persist=0.66, gradual=True, confirm=conf, runners=runners, exit=ex,
+                   action=act)
+
+
+def _confirm(d: pd.DataFrame, conf: str, direction: np.ndarray) -> np.ndarray:
+    """direction: +1 for a steamer (shortening), -1 for a drifter."""
+    if conf == "none":
+        return np.ones(len(d), bool)
+    if conf in ("wom_with", "wom_against"):
+        x = direction * d["wom_chg_30"].to_numpy()
+        return x >= 0.05 if conf == "wom_with" else x <= -0.05
+    if conf in ("wap_room", "wap_past"):
+        x = direction * d["wap_gap"].to_numpy()  # steamer still longer than its WAP = room to shorten
+        return x >= 1.0 if conf == "wap_room" else x <= -1.0
+    if conf == "vol_accel":
+        return d["vol_accel"].to_numpy() >= 2.0
+    if conf == "spn_with":
+        return direction * -d["spn_gap"].to_numpy() >= 0.02  # projected SP already shorter than a steamer's price
+    raise ValueError(conf)
+
+
 def knock_rules():
     for ld, lag, runners, ex, act in itertools.product((0.5, 1.0, 2.0, 4.0), (0.25, 0.5, 1.0, 2.0), ("top3", "all"),
                                                        EXITS, ("follow", "fade")):
@@ -242,11 +280,13 @@ def apply_rule(d: pd.DataFrame, r: dict) -> pd.DataFrame:
     knock-on follow = finish the rebalancing: lay a runner that has not lengthened enough (lag > 0), back one that
              has lengthened too much (lag < 0); fade = the opposite"""
     sel = (d["rank"] <= 3).to_numpy() if r["runners"] == "top3" else np.ones(len(d), bool)
-    if r["family"] == "gradual":
+    if r["family"] in ("gradual", "confirmed"):
         net = d[f"net_{r['W']}"].to_numpy()
         sel = sel & (np.abs(net) >= r["k"]) & (d[f"persist_{r['W']}"].to_numpy() >= r["persist"])
         if r["gradual"]:
             sel = sel & (d[f"jump_{r['W']}"].to_numpy() < 2)
+        if r["family"] == "confirmed":
+            sel = sel & _confirm(d, r["confirm"], np.sign(net))
         back_if_follow = net > 0
     else:
         lag = d["lag"].to_numpy()
@@ -259,6 +299,8 @@ def apply_rule(d: pd.DataFrame, r: dict) -> pd.DataFrame:
 
 
 def rule_name(r: dict) -> str:
+    if r["family"] == "confirmed":
+        return f"confirmed W{r['W']} k{r['k']} {r['confirm']} {r['runners']} exit {r['exit']} {r['action']}"
     if r["family"] == "gradual":
         return (f"gradual W{r['W']} k{r['k']} p{r['persist']} {'nojump' if r['gradual'] else 'any'} {r['runners']} "
                 f"exit {r['exit']} {r['action']}")
@@ -317,7 +359,7 @@ def run(d: pd.DataFrame, label: str, out: str, min_races: int, top: int = 15) ->
     print(f"[{label}] {d['race'].nunique()} races, {len(d):,} samples; TRAIN {len(tr_r)} / VAL {len(va_r)} / "
           f"TEST {len(te_r)} races", flush=True)
     res = {}
-    for fam, gen in (("gradual", gradual_rules), ("knock-on", knock_rules)):
+    for fam, gen in (("gradual", gradual_rules), ("confirmed", confirmed_rules), ("knock-on", knock_rules)):
         rules = list(gen())
         s = search(tr, rules, min_races)
         if not len(s):
@@ -328,7 +370,7 @@ def run(d: pd.DataFrame, label: str, out: str, min_races: int, top: int = 15) ->
         best = s.head(top).copy()
         for split_name, df in (("val", va), ("test", te)):
             sc = [score(df, {k_: row[k_] for k_ in row.index if k_ in (
-                "family", "W", "k", "persist", "gradual", "runners", "exit", "action", "lead", "lag")})
+                "family", "W", "k", "persist", "gradual", "confirm", "runners", "exit", "action", "lead", "lag")})
                 for _, row in best.iterrows()]
             best[f"{split_name}_mean"] = [x["mean"] for x in sc]
             best[f"{split_name}_t"] = [x["t"] for x in sc]
@@ -344,6 +386,54 @@ def run(d: pd.DataFrame, label: str, out: str, min_races: int, top: int = 15) ->
                         test_races=int(b["test_races"]), edge=edge,
                         train_rules_positive_t2=int(((s["mean"] > 0) & (s["t"] > 2)).sum()), rules_tested=len(s))
     return res
+
+
+MODEL_FEATS = ([f"{x}_{W}" for W in WINDOWS for x in ("net", "persist", "steps", "jump", "traded")] +
+               ["wom", "wom_chg_30", "wap_gap", "vol_accel", "spn_gap", "lead_dp", "lag", "rank", "price", "spread",
+                "t_to_start"])
+MODEL_LABELS = ["back_60", "lay_60", "back_trail", "lay_trail"]
+
+
+def model_test(d: pd.DataFrame, seed: int = 0) -> tuple[pd.DataFrame, dict]:
+    """Gradient-boosted trees on every feature predict the four executable returns (TRAIN days); trade the best
+    prediction above a threshold picked on VAL; TEST once."""
+    from sklearn.ensemble import HistGradientBoostingRegressor
+
+    tr_r, va_r, te_r = split_by_date(sorted(d["race"].unique()))
+    tr, va, te = d[d["race"].isin(tr_r)], d[d["race"].isin(va_r)], d[d["race"].isin(te_r)]
+    feats = [f for f in MODEL_FEATS if f in d and tr[f].notna().any() and tr[f].nunique() > 1]
+    Xtr, Xva, Xte = (x[feats].to_numpy(np.float32) for x in (tr, va, te))
+    pv, pt = [], []
+    for y in MODEL_LABELS:
+        m = tr[y].notna().to_numpy()
+        reg = HistGradientBoostingRegressor(max_iter=300, learning_rate=0.05, max_leaf_nodes=31, min_samples_leaf=200,
+                                            l2_regularization=1.0, random_state=seed)
+        reg.fit(Xtr[m], np.clip(tr[y].to_numpy()[m], -50, 50))
+        pv.append(reg.predict(Xva))
+        pt.append(reg.predict(Xte))
+    Pva, Pte = np.stack(pv, 1), np.stack(pt, 1)
+
+    def trades(df, P, thr):
+        j = P.argmax(1)
+        sel = P[np.arange(len(P)), j] > thr
+        ret = df[MODEL_LABELS].to_numpy()[np.where(sel)[0], j[sel]]
+        return pd.DataFrame({"race": df["race"].to_numpy()[sel], "ret": ret}).dropna()
+
+    rows, best = [], None
+    min_r = min(20, max(3, va["race"].nunique() // 3))
+    for thr in (0.0, 0.25, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0):
+        v = trades(va, Pva, thr)
+        r = rt(v["ret"], v["race"]) if len(v) else dict(mean=np.nan, t=np.nan, races=0)
+        rows.append(dict(threshold=thr, val_trades=len(v), val_mean=r["mean"], val_t=r["t"], val_races=r["races"]))
+        if r["races"] >= min_r and np.isfinite(r["mean"]) and (best is None or r["mean"] > best[1]):
+            best = (thr, r["mean"])
+    res = {}
+    if best is not None:
+        tt = trades(te, Pte, best[0])
+        r = rt(tt["ret"], tt["race"]) if len(tt) else dict(mean=np.nan, t=np.nan, races=0)
+        res = dict(threshold=best[0], test_trades=len(tt), test_mean=r["mean"], test_t=r["t"], test_races=r["races"],
+                   edge=bool(r["races"] >= 30 and (r["mean"] or -1) > 0 and (r["t"] or 0) > 2 and best[1] > 0))
+    return pd.DataFrame(rows), res
 
 
 def control_tapes(out_dir: str, n: int = 120) -> list[str]:
@@ -385,10 +475,13 @@ def main(argv=None):
               else "control: NOT found -> a null result on real races means little", flush=True)
 
     cache = os.path.join(a.out, "samples.parquet")
-    if os.path.exists(cache):
-        d = pd.read_parquet(cache)
+    d = pd.read_parquet(cache) if os.path.exists(cache) else None
+    if d is not None and any(f not in d for f in MODEL_FEATS):
+        print(f"\n{cache} is from an older version: rebuilding the samples", flush=True)
+        d = None
+    elif d is not None:
         print(f"\nreusing {cache}: {len(d):,} samples", flush=True)
-    else:
+    if d is None:
         d = collect(list_tapes(a.tapes), a.workers)
         d.to_parquet(cache, index=False)
 
@@ -399,7 +492,14 @@ def main(argv=None):
 
     print("\n=== 2. Rule search on TRAIN days, best rules scored on VAL and TEST ===")
     res = run(d, "real", a.out, a.min_races)
-    verdict.update(real=res, edge=any(v["edge"] for v in res.values()))
+
+    print("\n=== 3. Gradient-boosted model on every feature (moves, order flow, WOM, WAP, projected SP, knock-on): "
+          "threshold on VAL, TEST once ===")
+    mv, mres = model_test(d)
+    mv.to_csv(os.path.join(a.out, "model_val.csv"), index=False)
+    print(mv.round(3).to_string(index=False))
+    print(json.dumps(mres, indent=1, default=float))
+    verdict.update(real=res, model=mres, edge=any(v["edge"] for v in res.values()) or bool(mres.get("edge")))
     json.dump(verdict, open(os.path.join(a.out, "verdict.json"), "w"), indent=1, default=float)
     print("\n=== Verdict ===")
     print(json.dumps(verdict, indent=1, default=float))

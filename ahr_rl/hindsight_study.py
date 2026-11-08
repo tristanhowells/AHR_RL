@@ -52,7 +52,8 @@ HORIZONS = (60, 120)
 STAKE = 10.0
 RACE_CATS = ["race_type", "state", "metro", "distance_b", "class_group", "race_no_b", "field_b", "volume_b", "dow",
              "time_of_day"]
-RUNNER_FEATS = ["rank", "log_price", "share", "spread_ticks", "best_usd_log", "wom", "mom_10", "mom_30", "mom_60",
+RUNNER_FEATS = ["rank", "log_price", "share", "spread_ticks", "best_usd_log", "wom", "wom_chg_30", "wap_gap",
+                "vol_accel", "mom_10", "mom_30", "mom_60",
                 "vol_60", "traded_30_log", "spn_gap", "t_to_start", "overround", "matched_log"]
 RACE_FEATS = ["field", "distance_m", "race_no", "is_metro", "race_type_c", "class_c", "state_c", "venue_c", "hour",
               "dow_c"]
@@ -77,6 +78,35 @@ def _prices(t: Tape):
     both = np.isfinite(bb) & np.isfinite(bl) & (bl > bb)
     bb[~both], bl[~both] = np.nan, np.nan
     return bb, bl
+
+
+def flow_arrays(t: Tape, min_wap_usd: float = 50.0):
+    """Per (row, runner): cumulative $ traded, session WAP (volume-weighted average matched price, once at least
+    min_wap_usd has traded) and weight of money over the best 3 levels (back side / both sides)."""
+    vol = np.zeros((t.n_steps, t.n_runners))
+    pv = np.zeros((t.n_steps, t.n_runners))
+    m = (t.trade_step < t.n_steps) & (t.trade_tick >= 0)
+    ts, tr = t.trade_step[m], t.trade_runner[m].astype(int)
+    np.add.at(vol, (ts, tr), t.trade_vol[m])
+    np.add.at(pv, (ts, tr), t.trade_vol[m] * PRICES[t.trade_tick[m].astype(int)])
+    cvol, cpv = np.cumsum(vol, 0), np.cumsum(pv, 0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        wap = np.where(cvol >= min_wap_usd, cpv / cvol, np.nan)
+        bs3, ls3 = t.back_size[:, :, :3].sum(-1), t.lay_size[:, :, :3].sum(-1)
+        wom = np.where(bs3 + ls3 > 0, bs3 / (bs3 + ls3), np.nan)
+    return cvol, wap, wom
+
+
+def flow_features(cvol, wap, wom, mid, s: int, r: int, k) -> dict:
+    """wom_chg_30  change in weight of money over the last 30s
+    wap_gap     100 x log(mid / session WAP): + = the price is longer than where its money traded
+    vol_accel   $ traded in the last 30s / the average 30s over the 60s before (1 = steady, > 1 = speeding up)"""
+    s30, s90 = max(0, s - k(30)), max(0, s - k(90))
+    last = cvol[s, r] - cvol[s30, r]
+    before = (cvol[s30, r] - cvol[s90, r]) / max((s30 - s90) / k(30), 1e-9) if s30 > s90 else np.nan
+    return dict(wom_chg_30=float(wom[s, r] - wom[s30, r]) if s >= k(30) else np.nan,
+                wap_gap=float(100 * np.log(mid[s, r] / wap[s, r])) if np.isfinite(wap[s, r]) else np.nan,
+                vol_accel=float(last / (before + 1.0)) if np.isfinite(before) else np.nan)
 
 
 def _net(g, c):
@@ -146,6 +176,7 @@ def sample_race(path: str, cat_idx: dict) -> tuple[pd.DataFrame, pd.DataFrame] |
     m = t.trade_step < t.n_steps
     np.add.at(vol, (t.trade_step[m], t.trade_runner[m].astype(int)), t.trade_vol[m])
     cvol = np.cumsum(vol, 0)
+    _, wap, wom3 = flow_arrays(t)
     lmid = np.log(mid)
     dl = np.diff(lmid, axis=0, prepend=np.nan)
     bs3, ls3 = t.back_size[:, :, :3].sum(-1), t.lay_size[:, :, :3].sum(-1)
@@ -172,6 +203,7 @@ def sample_race(path: str, cat_idx: dict) -> tuple[pd.DataFrame, pd.DataFrame] |
                        spn_gap=float(np.log(t.spn[s, r] / mid[s, r])) if t.spn[s, r] > 1 else np.nan,
                        t_to_start=float(-t.t_rel[s]), overround=float(book[s]),
                        matched_log=float(np.log1p(t.total_matched[s])))
+            rec.update(flow_features(cvol, wap, wom3, mid, s, r, k))
             for W in (10, 30, 60):
                 s0 = s - k(W)
                 rec[f"mom_{W}"] = float((p[s, r] - p[s0, r]) * 100) if s0 >= 0 and np.isfinite(p[s0, r]) else np.nan
@@ -433,10 +465,16 @@ def main(argv=None):
     cat_idx = index_catalogues(a.catalogues) if a.catalogues and os.path.isdir(a.catalogues) else {}
     paths = list_tapes(a.tapes)
     cache = os.path.join(a.out, "samples.parquet")
+    d = None
     if os.path.exists(cache) and os.path.exists(os.path.join(a.out, "oracle_runners.csv")):
         d, o = pd.read_parquet(cache), pd.read_csv(os.path.join(a.out, "oracle_runners.csv"))
-        print(f"reusing {cache}: {len(d):,} samples", flush=True)
-    else:
+        missing = [f for f in RUNNER_FEATS if f not in d]
+        if missing:  # samples from an older version: rebuild with the new features
+            print(f"{cache} lacks {missing}: rebuilding the samples", flush=True)
+            d = None
+        else:
+            print(f"reusing {cache}: {len(d):,} samples", flush=True)
+    if d is None:
         os.environ["OMP_NUM_THREADS"] = "1"
         parts, oparts = [], []
         with ProcessPoolExecutor(a.workers, mp_context=mp.get_context("spawn")) as pool:
