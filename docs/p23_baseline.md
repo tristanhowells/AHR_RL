@@ -27,3 +27,20 @@ Positive control (planted gradual steamer): found (`control_found_gradual_move: 
   - a best TRAIN rule well above -8% (the gradual / knock-on best);
   - a TEST result above -4.8%;
   - "more with than against" clearly above 53.5%.
+
+## Rerun with order-flow features (2026-11-08 01:13)
+
+- Gradual and knock-on: identical to the baseline above (same samples, deterministic), as expected.
+- Note on the baseline: the pre-registered rule is the best by t. When every rule loses, that favours thinly
+  traded rules. The best gradual rule by mean is -3.46% (W90 k6 any-jump top3, exit 30s, fade; 1,271 races).
+  That figure is the fairer benchmark.
+- Confirmed (gradual + WOM / WAP / volume / projected-SP condition):
+  - 744 rules, 0 with a positive mean;
+  - best by mean and by t: W30 k4 wom_with top3, exit 60s, fade, -2.92% TRAIN (t -3.7), -2.43% VAL, -3.90% TEST
+    (t -3.9, 40 races);
+  - best per condition: wom_with -2.92, wom_against -3.06, wap_past -3.06, wap_room -3.25, vol_accel -3.55,
+    spn_with -4.31.
+- Model on every feature: threshold 0 on VAL (-0.39%, 52 races); TEST -0.23% (t -0.19), 195 trades in 51 races.
+  It is close to breakeven only by trading rarely: about 4 trades per traded race, ~0.02% of samples.
+- Verdict: no edge. The order-flow conditions improve the best rule by about 0.5pp (-3.46% -> -2.92%) but none
+  is positive.
