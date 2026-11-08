@@ -748,3 +748,21 @@ def test_back_all_thin_ladder_leaves_exposure():
     assert not x["full_hedge"] and x["hedge_frac"] < 0.5 and x["win"] < x["lose"]  # the rest stays open
     full = runner_trade(make_synthetic_tape(1, trend_every_s=30.0), 0, s_in, s_out, "lay", 10.0)
     assert full["full_hedge"] and np.isclose(full["touch"], full["win"])  # deep ladder: touch == realised green
+
+
+def test_hindsight_labels(tmp_path):
+    from ahr_rl.hindsight_study import sample_race
+
+    t = make_synthetic_tape(3, trend_every_s=20.0)
+    t.name = "20260101_1200_Syn_1_3"
+    p = str(tmp_path / f"{t.name}.npz")
+    t.save(p)
+    d, o = sample_race(p, {})
+    # hindsight from a sample can always do at least as well as the fixed 60s / 120s exit inside its window
+    for side in ("back", "lay"):
+        for H in (60, 120):
+            m = d[f"exec_{side}_{H}"].notna() & d[f"oracle_{side}"].notna() & (d["t_to_start"] > H + 1)
+            assert (d.loc[m, f"oracle_{side}"] >= d.loc[m, f"exec_{side}_{H}"] - 1e-4).all()
+    assert (o["green_pct"] >= 0).all() and (o["t_exit"] > o["t_entry"]).all()
+    # the planted steamer: its momentum and the hindsight back are the strongest in the race
+    assert d.groupby("runner")["mom_30"].mean().idxmax() == d.groupby("runner")["oracle_back"].mean().idxmax()
