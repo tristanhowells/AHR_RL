@@ -766,3 +766,21 @@ def test_hindsight_labels(tmp_path):
     assert (o["green_pct"] >= 0).all() and (o["t_exit"] > o["t_entry"]).all()
     # the planted steamer: its momentum and the hindsight back are the strongest in the race
     assert d.groupby("runner")["mom_30"].mean().idxmax() == d.groupby("runner")["oracle_back"].mean().idxmax()
+
+
+def test_move_detect_samples_and_rules(tmp_path):
+    from ahr_rl.move_detect_study import apply_rule, sample_race
+
+    t = make_synthetic_tape(5, trend_every_s=6.0)  # one runner shortens a tick every 6s
+    t.name = "20260101_1200_Syn_1_5"
+    p = str(tmp_path / f"{t.name}.npz")
+    t.save(p)
+    d = sample_race(p)
+    steamer = d.groupby("runner")["net_60"].mean().idxmax()
+    g = d[d["runner"] == steamer]
+    assert (g["net_60"].dropna() > 0).mean() > 0.9  # its 60s move reads as steaming
+    assert g["back_60"].mean() > 0 and g["max_shorten"].mean() > g["max_lengthen"].mean()
+    r = dict(family="gradual", W=60, k=3, persist=0.8, gradual=True, runners="all", exit="60", action="follow")
+    fol = apply_rule(d, r)
+    fad = apply_rule(d, dict(r, action="fade"))
+    assert len(fol) == len(fad) > 0 and fol["ret"].mean() > fad["ret"].mean()
