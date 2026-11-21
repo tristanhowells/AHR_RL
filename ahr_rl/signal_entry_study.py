@@ -139,22 +139,22 @@ def race_ic(x, y, race) -> float:
     return float(ics.mean()) if len(ics) else np.nan
 
 
-def orient(sig: pd.DataFrame, train: np.ndarray) -> dict:
+def orient(sig: pd.DataFrame, train: np.ndarray, raw=RAW, target: str = "fwd_30") -> dict:
     """z-score each raw signal on TRAIN rows, sign it so high = shortening next, and fit the combo."""
     info = {}
     tr = sig[train]
-    for c in RAW:
+    for c in raw:
         mu, sd = float(tr[c].mean()), float(tr[c].std()) or 1.0
-        ic = race_ic(tr[c], tr["fwd_30"], tr["race"])
+        ic = race_ic(tr[c], tr[target], tr["race"])
         sign = 1.0 if (np.isnan(ic) or ic >= 0) else -1.0
         sig[f"o_{c}"] = sign * (sig[c] - mu) / sd
         info[c] = dict(train_ic=ic, sign=sign)
-    X = sig.loc[train, [f"o_{c}" for c in RAW]].fillna(0.0).to_numpy()
-    y = sig.loc[train, "fwd_30"].to_numpy()
+    X = sig.loc[train, [f"o_{c}" for c in raw]].fillna(0.0).to_numpy()
+    y = sig.loc[train, target].to_numpy()
     m = np.isfinite(y)
     w = np.linalg.lstsq(np.c_[X[m], np.ones(m.sum())], y[m], rcond=None)[0]
-    sig["o_combo"] = sig[[f"o_{c}" for c in RAW]].fillna(0.0).to_numpy() @ w[:-1]
-    info["combo"] = dict(weights={c: float(v) for c, v in zip(RAW, w[:-1])})
+    sig["o_combo"] = sig[[f"o_{c}" for c in raw]].fillna(0.0).to_numpy() @ w[:-1]
+    info["combo"] = dict(weights={c: float(v) for c, v in zip(raw, w[:-1])})
     return info
 
 
@@ -199,7 +199,8 @@ def _lift(rc: np.ndarray, v: np.ndarray, in_rule: np.ndarray, n_races: int):
     return float(d.mean()), float(d.mean() / (d.std(ddof=1) / np.sqrt(len(d))))
 
 
-def rule_search(df: pd.DataFrame, train: pd.Series, cuts: dict, min_races: int, top: int = 15) -> pd.DataFrame:
+def rule_search(df: pd.DataFrame, train: pd.Series, cuts: dict, min_races: int, top: int = 15,
+                signals=SIGNALS) -> pd.DataFrame:
     """Every slice scored on TRAIN days (race-level t); the top ones scored once on HOLDOUT, each with
     its baseline (same side, k, hold, liquidity and rank, no signal condition) and the within-race lift
     over it, so a period that favours one side (e.g. HOLDOUT days were better for backs) is not
@@ -214,7 +215,7 @@ def rule_search(df: pd.DataFrame, train: pd.Series, cuts: dict, min_races: int, 
         rc, tr, liq, fav = rc_all[idx], tr_all[idx], liq_all[idx], fav_all[idx]
         evs = {h: df[f"ev_attempt_{h}"].to_numpy()[idx] for h in (60, 120)} if k > 0 else \
             {60: df["ev_fill"].to_numpy()[idx]}
-        for sig in SIGNALS:
+        for sig in signals:
             o = df["o_" + sig].to_numpy()[idx]
             # both tails for both sides (the TRAIN orientation can differ within a slice), plus "quiet": the
             # middle of the signal's range (added after seeing section B: flagged, needs a forward test anyway)

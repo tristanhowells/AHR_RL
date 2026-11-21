@@ -784,3 +784,18 @@ def test_move_detect_samples_and_rules(tmp_path):
     fol = apply_rule(d, r)
     fad = apply_rule(d, dict(r, action="fade"))
     assert len(fol) == len(fad) > 0 and fol["ret"].mean() > fad["ret"].mean()
+
+
+def test_wom_strategy_signals_and_control(tmp_path):
+    from ahr_rl.wom_strategy import control_tape, wom_rows
+
+    t = control_tape(7)
+    t.name = "20990101_1200_WomCtl_1_7"
+    p = str(tmp_path / f"{t.name}.npz")
+    t.save(p)
+    d = wom_rows(p)
+    assert {"wom", "wom_chg_10", "wom_chg_30", "wom_chg_60", "wom1_chg_30", "wom_z_30", "fwd_30"} <= set(d.columns)
+    m = d[["wom_chg_30", "fwd_30"]].dropna()
+    # planted: back-side money builds before a shortening, so a rising WOM leads a rising implied probability
+    assert np.corrcoef(m["wom_chg_30"], m["fwd_30"])[0, 1] > 0.2
+    assert (t.bsp > 1).all() and abs((1 / t.bsp).sum() - 1) < 1e-3  # a 100% BSP book, so orders can be valued
