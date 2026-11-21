@@ -799,3 +799,23 @@ def test_wom_strategy_signals_and_control(tmp_path):
     # planted: back-side money builds before a shortening, so a rising WOM leads a rising implied probability
     assert np.corrcoef(m["wom_chg_30"], m["fwd_30"])[0, 1] > 0.2
     assert (t.bsp > 1).all() and abs((1 / t.bsp).sum() - 1) < 1e-3  # a 100% BSP book, so orders can be valued
+
+
+def test_dutch_forced_book_control(tmp_path):
+    from ahr_rl.dutch_study import add_buckets, book_table, control_tape, forced_dutch
+    from ahr_rl.passive_entry_study import sample_tape
+    from ahr_rl.wom_strategy import wom_rows
+
+    t = control_tape(60_001)
+    t.name = "20990101_1200_DutchCtl_1_1"
+    p = str(tmp_path / f"{t.name}.npz")
+    t.save(p)
+    assert abs((1 / t.bsp).sum() - 1) < 1e-3
+    orders, sig = sample_tape(p, every_s=20.0, last_s=600.0), wom_rows(p, every_s=20.0, last_s=600.0)
+    books = book_table(orders)
+    assert books["complete"].all() and (books["back_book"] > 1).mean() > 0.9  # no free arbitrage on the quotes
+    fd = add_buckets(forced_dutch(orders, sig), books).dropna(subset=["green_pct"])
+    g = fd.groupby(["side", "k", "H"])["green_pct"].mean()
+    # crossing every leg now pays the spread; resting every leg a tick past the fair price completes green
+    assert g[("back", 0, 60)] < 0 and g[("lay", 0, 60)] < 0
+    assert g[("back", 2, 120)] > 0.5 and g[("lay", 2, 120)] > 0.5
