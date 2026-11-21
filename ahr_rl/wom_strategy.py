@@ -8,6 +8,11 @@ better than the best price, waiting 60 / 120s), greened at BSP, which cost ~0.2%
 improvement to adverse selection. k = 0 (cross now, green at BSP) is kept as the crossing reference. The
 question: does WOM change screen out the bad fills well enough to leave a profit?
 
+Two exits, so the vehicle matches the signal's horizon:
+  bsp    P15's: every fill greened at BSP (held to the off, up to 10 min)
+  cross  out by crossing the spread 60 / 120s after the decision (the signal is about the next 30-120s; held to
+         the off, a 60s signal washes out - the positive control shows it)
+
 Signals, at P15's decision rows (every 20s in the last 10 min), live (no look-ahead):
   wom          weight of money, best 3 levels: back-side $ / (back + lay)
   wom_chg_10 / _30 / _60   its change over 10 / 30 / 60s
@@ -39,6 +44,7 @@ import numpy as np
 import pandas as pd
 
 from .env import list_tapes, split_by_date
+from .ladder import PRICES
 from .passive_entry_study import add_values
 from .passive_entry_study import sample_tape as sample_orders
 from .rebalance_study import _prob_grid
@@ -56,7 +62,10 @@ def wom_rows(path: str, every_s: float = 20.0, last_s: float = 600.0):
     if not t.went_in_play:
         return None
     race = os.path.basename(path).split(".npz")[0]
-    p, valid, end, _, _ = _prob_grid(t)
+    p, valid, end, bt, lt = _prob_grid(t)
+    ok = ~t.suspended[:, None] & t.active
+    xb = pd.DataFrame(np.where(ok & (bt >= 0), PRICES[np.maximum(bt, 0)], np.nan)).ffill(limit=10).to_numpy()
+    xl = pd.DataFrame(np.where(ok & (lt >= 0), PRICES[np.maximum(lt, 0)], np.nan)).ffill(limit=10).to_numpy()
     k = lambda sec: int(round(sec / t.dt))
     bs3, ls3 = t.back_size[:, :, :3].sum(-1), t.lay_size[:, :, :3].sum(-1)
     bs1, ls1 = t.back_size[:, :, 0], t.lay_size[:, :, 0]
@@ -81,6 +90,9 @@ def wom_rows(path: str, every_s: float = 20.0, last_s: float = 600.0):
             past = past[np.isfinite(past)]
             sd = float(np.std(past)) if len(past) >= 20 else np.nan
             rec["wom_z_30"] = float(rec["wom_chg_30"] / sd) if sd and np.isfinite(sd) and sd > 0 else np.nan
+            for H in (60, 120):  # crossing-out prices: decided at s + H, filled a row later
+                x = min(s + k(H) + 1, end)
+                rec[f"exit_back_{H}"], rec[f"exit_lay_{H}"] = float(xb[x, r]), float(xl[x, r])
             for H in FWD:
                 s2 = min(s + k(H), end)
                 rec[f"fwd_{H}"] = (float(100 * np.log(p[s2, r] / p[s, r]))
@@ -98,7 +110,7 @@ def wom_rows(path: str, every_s: float = 20.0, last_s: float = 600.0):
 def control_tape(seed: int, n_runners: int = 6, pre_s: float = 600.0, post_s: float = 60.0, dt: float = 0.5):
     """Random-walk races where, for 30s before each tick step, the money waiting on the side the price is about
     to move to grows (back side before a shortening, lay side before a drift): WOM change leads the price."""
-    from .ladder import N_TICKS, PRICES
+    from .ladder import N_TICKS
 
     rng = np.random.default_rng(seed)
     T, R, K = int((pre_s + post_s) / dt), n_runners, 8
@@ -128,7 +140,7 @@ def control_tape(seed: int, n_runners: int = 6, pre_s: float = 600.0, post_s: fl
     tr = np.array(tr, np.float64).reshape(-1, 4)
 
     fair = PRICES[mid[-1]]
-    bsp = (fair * (1.0 / (1.0 / fair).sum())).astype(np.float32)  # a 100% book at the last mid
+    bsp = (fair * (1.0 / fair).sum()).astype(np.float32)  # a 100% book at the last mid (sum of 1 / bsp = 1)
     return Tape(market_id=f"ctl.{seed}", name="", dt=dt, t_rel=t_rel, back_tick=bt, back_size=bs, lay_tick=lt,
                 lay_size=ls, ltp_tick=mid.astype(np.int16), tv=np.cumsum(np.ones((T, R), np.float32), 0),
                 spn=np.zeros((T, R), np.float32), active=np.ones((T, R), bool), suspended=np.zeros(T, bool),
@@ -151,6 +163,49 @@ def control_paths(out_dir: str, n: int = 120) -> list[str]:
             t.save(p)
         paths.append(p)
     return paths
+
+
+def cross_vehicle(df: pd.DataFrame) -> pd.DataFrame:
+    """The same orders, each fill closed by crossing the spread 60 / 120s after the decision instead of at BSP:
+    ev_attempt_H = filled share by H x the green at that exit; ev_fill = the 60s green (k = 0 crosses now)."""
+    x = df.copy()
+    back = (x["side"] == "back").to_numpy()
+    P, c = x["price"].to_numpy(float), x["comm"].to_numpy(float)
+    for H in (60, 120):
+        g = np.where(back, P / x[f"exit_lay_{H}"].to_numpy(float) - 1, 1 - P / x[f"exit_back_{H}"].to_numpy(float))
+        g = np.where(g > 0, g * (1 - c), g) * 100
+        x[f"x_{H}"] = g
+        x[f"ev_attempt_{H}"] = g * x[f"f{H}"].to_numpy(float)
+    x["ev_fill"] = x["x_60"]
+    return x
+
+
+def sections_bc(df, train, cuts, min_races, out, vname, log):
+    log("\n=== B. Does WOM change shrink adverse selection? Liquid runners, k = 1, hold 60s, by signal quintile ===")
+    log("(Q5 = says shorten: good for resting backs; Q1 = drift: good for resting lays)")
+    tb = pd.concat([quintile_table(df, c, s) for c in ("wom_chg_30", "wom_z_30", "combo") for s in ("back", "lay")],
+                   ignore_index=True)
+    tb.to_csv(os.path.join(out, f"B_quintiles_{vname}.csv"), index=False)
+    for c in ("wom_chg_30", "wom_z_30", "combo"):
+        log(f"\n{c}:")
+        log(tb[tb["signal"] == c].drop(columns="signal").round(3).to_string(index=False))
+
+    log(f"\n=== C. Rule search (WOM signal x side x tail x k x hold x liquidity x threshold x rank): TRAIN (>= "
+        f"{min_races} races) -> HOLDOUT ===")
+    rs = rule_search(df, train, cuts, min_races, signals=SIGNALS)
+    rs.to_csv(os.path.join(out, f"C_rules_{vname}.csv"), index=False)
+    if len(rs):
+        log(rs[["signal", "side", "when", "k", "hold", "liquid", "top", "fav_rank", "train_mean", "train_t",
+                "train_races", "holdout_mean", "holdout_t", "holdout_races", "holdout_drop_best"]].round(3)
+            .to_string(index=False))
+        log("\nthe same rules against their baseline (same slice, no WOM condition): the lift is what WOM adds")
+        log(rs[["signal", "side", "when", "k", "hold", "top", "fav_rank", "train_baseline", "train_lift",
+                "train_lift_t", "holdout_baseline", "holdout_lift", "holdout_lift_t"]].round(3).to_string(index=False))
+    best = rs.iloc[0].to_dict() if len(rs) else {}
+    edge = bool(best) and best["holdout_mean"] > 0 and (best["holdout_t"] or 0) > 2 and \
+        best["holdout_races"] >= 20 and best["holdout_drop_best"] > 0 and best["holdout_lift"] > 0
+    log(f"exit {vname}: " + ("EDGE on HOLDOUT, beating its baseline" if edge else "no edge on HOLDOUT"))
+    return rs, best, edge
 
 
 def analyse(paths, orders_path, out, a, log, t0, min_races: int) -> dict:
@@ -177,7 +232,9 @@ def analyse(paths, orders_path, out, a, log, t0, min_races: int) -> dict:
     df = add_values(orders.copy())
     df["t"] = df["t"].astype(np.float32)
     sig["t"] = sig["t"].astype(np.float32)
-    df = df.merge(sig[["race", "runner", "t"] + [f"o_{c}" for c in SIGNALS]], on=["race", "runner", "t"], how="inner")
+    xcols = [f"exit_{s_}_{H}" for s_ in ("back", "lay") for H in (60, 120)]
+    df = df.merge(sig[["race", "runner", "t"] + [f"o_{c}" for c in SIGNALS] + xcols], on=["race", "runner", "t"],
+                  how="inner")
     train = ~df["day"].isin(hold_days)
     df["is_train"] = train
     cut = (float(np.nanquantile(df.loc[train & (df["k"] == 0) & (df["t"] >= -300), "best_usd"], 0.8))
@@ -219,30 +276,16 @@ def analyse(paths, orders_path, out, a, log, t0, min_races: int) -> dict:
                 cuts[(c, lq, th)] = (float(np.nanquantile(b, 1 - th)), float(np.nanquantile(b, th)))
             cuts[(c, lq, "quiet")] = (float(np.nanquantile(b, 0.4)), float(np.nanquantile(b, 0.6)))
 
-    log("\n=== B. Does WOM change shrink adverse selection? Liquid runners, k = 1, hold 60s, by signal quintile ===")
-    log("(Q5 = says shorten: good for resting backs; Q1 = drift: good for resting lays)")
-    tb = pd.concat([quintile_table(df, c, s) for c in ("wom_chg_30", "wom_z_30", "combo") for s in ("back", "lay")],
-                   ignore_index=True)
-    tb.to_csv(os.path.join(out, "B_quintiles.csv"), index=False)
-    for c in ("wom_chg_30", "wom_z_30", "combo"):
-        log(f"\n{c}:")
-        log(tb[tb["signal"] == c].drop(columns="signal").round(3).to_string(index=False))
-
-    log(f"\n=== C. Rule search (WOM signal x side x tail x k x hold x liquidity x threshold x rank): TRAIN (>= "
-        f"{min_races} races) -> HOLDOUT ===")
-    rs = rule_search(df, train, cuts, min_races, signals=SIGNALS)
-    rs.to_csv(os.path.join(out, "C_rules.csv"), index=False)
-    if len(rs):
-        log(rs[["signal", "side", "when", "k", "hold", "liquid", "top", "fav_rank", "train_mean", "train_t",
-                "train_races", "holdout_mean", "holdout_t", "holdout_races", "holdout_drop_best"]].round(3)
-            .to_string(index=False))
-        log("\nthe same rules against their baseline (same slice, no WOM condition): the lift is what WOM adds")
-        log(rs[["signal", "side", "when", "k", "hold", "top", "fav_rank", "train_baseline", "train_lift",
-                "train_lift_t", "holdout_baseline", "holdout_lift", "holdout_lift_t"]].round(3).to_string(index=False))
-    best = rs.iloc[0].to_dict() if len(rs) else {}
-    edge = bool(best) and best["holdout_mean"] > 0 and (best["holdout_t"] or 0) > 2 and \
-        best["holdout_races"] >= 20 and best["holdout_drop_best"] > 0 and best["holdout_lift"] > 0
-    verdict = dict(liq_cut=cut, edge=edge, best_rule=best, orientation=info,
+    vehicles = {"bsp": df, "cross": cross_vehicle(df)}
+    best_by, edge_by, rs_by = {}, {}, {}
+    for vname, vdf in vehicles.items():
+        log(f"\n{'#' * 30} exit: {'green at BSP (held to the off)' if vname == 'bsp' else 'cross out 60 / 120s after the decision'} {'#' * 30}")
+        rs, best, edge = sections_bc(vdf, train, cuts, min_races, out, vname, log)
+        best_by[vname], edge_by[vname], rs_by[vname] = best, edge, rs
+    vbest = max(best_by, key=lambda v: (edge_by[v], np.nan_to_num(best_by[v].get("holdout_mean", -99), nan=-99)))
+    best, edge = best_by[vbest], edge_by[vbest]
+    verdict = dict(liq_cut=cut, edge=edge, best_exit=vbest, best_rule=best, orientation=info,
+                   by_exit={v: dict(edge=edge_by[v], best_rule=best_by[v]) for v in vehicles},
                    note="rule search over many slices: a pass is a hypothesis for a forward test")
     if edge:
         c = best["signal"]
@@ -252,7 +295,8 @@ def analyse(paths, orders_path, out, a, log, t0, min_races: int) -> dict:
                       k=int(best["k"]), hold_s=int(best["hold"]), liquid_only=lq, liq_cut=cut,
                       fav_rank=best["fav_rank"], orientation=info.get(c),
                       cut_values=cuts[(c, lq, th)] if th else cuts[(c, lq, "quiet")],
-                      exit="green at BSP", stake=10.0,
+                      exit="green at BSP" if vbest == "bsp" else f"cross out {int(best['hold'])}s after the decision",
+                      stake=10.0,
                       decide=("forward test on races recorded after the registration day; >= 100 races and 300 "
                               "attempts before judging, as P3c arm C"))
         json.dump(frozen, open(os.path.join(out, "strategy.json"), "w"), indent=1, default=float)
