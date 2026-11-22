@@ -222,6 +222,10 @@ def analyse(paths, orders_path, out, a, log, t0, min_races: int) -> dict:
         orders.to_parquet(os.path.join(out, "orders.parquet"), index=False)
     scache = os.path.join(out, "wom_signals.parquet")
     sig = pd.read_parquet(scache) if os.path.exists(scache) else None
+    if sig is not None and not set(orders["race"].unique()) <= set(sig["race"].unique()):
+        log(f"cached signals miss {len(set(orders['race'].unique()) - set(sig['race'].unique()))} of the orders' "
+            "races (recorded since the cache was built): rebuilding them")
+        sig = None
     if sig is None or any(c not in sig for c in RAW):
         sig = _pool(wom_rows, paths, kw, a.workers, t0, "signals")
         sig.to_parquet(scache, index=False)
@@ -332,6 +336,7 @@ def main(argv=None):
     def log(msg=""):
         print(msg, flush=True)
         logf.write(str(msg) + "\n")
+        logf.flush()  # so a run that dies part-way leaves its log on Drive
 
     verdict = {}
     if not a.skip_control:

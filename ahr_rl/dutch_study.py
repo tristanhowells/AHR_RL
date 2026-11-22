@@ -170,10 +170,13 @@ def analyse(paths, orders_path, signals_path, out, workers, log, t0, min_races) 
     else:
         orders = _pool(sample_orders, paths, kw, workers, t0, "orders")
         orders.to_parquet(os.path.join(out, "orders.parquet"), index=False)
-    if signals_path and os.path.exists(signals_path):
-        sig = pd.read_parquet(signals_path)
-        log(f"loaded {len(sig):,} signal rows from {signals_path}")
-    else:
+    sig = pd.read_parquet(signals_path) if signals_path and os.path.exists(signals_path) else None
+    if sig is not None:
+        miss = set(orders["race"].unique()) - set(sig["race"].unique())
+        log(f"loaded {len(sig):,} signal rows from {signals_path}" +
+            (f"; they miss {len(miss)} of the orders' races: rebuilding" if miss else ""))
+        sig = None if miss else sig
+    if sig is None:
         sig = _pool(wom_rows, paths, kw, workers, t0, "signals")
         sig.to_parquet(os.path.join(out, "wom_signals.parquet"), index=False)
     for d_ in (orders, sig):
@@ -302,6 +305,7 @@ def main(argv=None):
     def log(msg=""):
         print(msg, flush=True)
         logf.write(str(msg) + "\n")
+        logf.flush()
 
     verdict = {}
     if not a.skip_control:
